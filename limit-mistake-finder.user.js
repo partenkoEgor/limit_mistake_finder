@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.9
+// @version      1.10
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.9';
+  const VERSION = '1.10';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -754,6 +754,30 @@
         }
       }
 
+      // Отличительные слова: строки одного метода различаются словами
+      // («D17 QR-code Tunisia» / «D17 Tunisia»). Берём строку, чьё
+      // отличительное слово есть в method/Subagent тикета; если таких слов
+      // в тикете нет — строку без них (обычный D17, а не QR)
+      const distinctLimits = list => Object.keys(list.filter(hasLimit).reduce((m, e) => { m[e.min + '|' + e.max] = 1; return m; }, {})).length;
+      if (distinctLimits(cands) > 1) {
+        const tw = normName(ticket.method + ' ' + ticket.subagent).split(' ');
+        // бренды сюда не входят — проект выбирает brandFilter
+        const wordsOf = e => {
+          const bw = e.brandTags.join(' ').split(' ');
+          return e.norm.split(' ').filter(w => w.length >= 2 && !/^\d+$/.test(w) && !isStopName(w, codes)
+            && GENERIC_WORDS.indexOf(w) === -1 && bw.indexOf(w) === -1);
+        };
+        const sets = cands.map(wordsOf);
+        const all = sets.reduce((u, ws) => u.concat(ws), []);
+        const distinguishing = all.filter((w, i) => all.indexOf(w) === i && !sets.every(ws => ws.indexOf(w) !== -1));
+        if (distinguishing.length) {
+          const hit = cands.filter((e, i) => sets[i].some(w => distinguishing.indexOf(w) !== -1 && tw.indexOf(w) !== -1));
+          const plain = cands.filter((e, i) => !sets[i].some(w => distinguishing.indexOf(w) !== -1));
+          if (hit.length && hit.length < cands.length) cands = hit;
+          else if (!hit.length && plain.length && plain.length < cands.length) cands = plain;
+        }
+      }
+
       // «Субы» / «Агенты:»: исключение со своим лимитом → строка, где указан суб
       const hasList = e => e.subsInfo && (e.subsInfo.subs.length || e.subsInfo.exceptions.length);
       const withSubs = cands.filter(hasList);
@@ -785,7 +809,6 @@
 
       // последний разделитель: слово из Subagent в названии строки
       // («Anamudi Azerbaijan BirBank» → «Bank köçürməsi - BirBank»)
-      const distinctLimits = list => Object.keys(list.filter(hasLimit).reduce((m, e) => { m[e.min + '|' + e.max] = 1; return m; }, {})).length;
       if (sn && distinctLimits(cands) > 1) {
         const words = sn.split(' ').filter(w => w.length >= 4 && !isStopName(w, codes) && GENERIC_WORDS.indexOf(w) === -1);
         const byWord = cands.filter(e => words.some(w => e.aliases.some(a => hasWords(a, w))));
