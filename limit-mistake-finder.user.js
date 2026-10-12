@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.5
+// @version      1.6
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.5';
+  const VERSION = '1.6';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -82,6 +82,11 @@
     // скобках 2+ раз. По nameRef тикета выбирается строка своего проекта.
     knownBrands: ['1xcasino', 'afropari', 'bizbet', 'rolsbet', 'melbet', 'betwinner', 'megapari', 'paripesa',
       '22bet', 'linebet', 'helabet', '888starz', 'betandyou', '1xbit', 'dbbet', 'xparibet', 'betpari'],
+
+    // Проекты (nameRef), которые считаются webDefault: строка — точное
+    // совпадение после нормализации, RegExp — по шаблону. «1xbet22.com» →
+    // «1xbet22com» подходит под /^1xbet/
+    webDefaultRefs: ['webdefault', /^1xbet/],
 
     // Пауза между страницами списка (мс)
     pageDelay: 400,
@@ -451,6 +456,7 @@
             countryKeys: countryKeys(countryCell + ' ' + heading),
             striked: !!row.striked,
             raw: row.cells.slice(1).map(normSpace).filter(Boolean).join(' | '),
+            rawNorm: normName(row.cells.slice(1).join(' ')),
           });
         });
       });
@@ -558,12 +564,21 @@
     // Проект тикета (nameRef/refId) → строки Confluence этого проекта.
     // webDefault — строки без бренда (или с webdefault в «Переключалке»);
     // другой проект — строки с его названием или refId в «Переключалке».
+    // Проекты, которые считаются webDefault: сам webDefault и зеркала 1xbet
+    // («1xbet22.com» → «1xbet22com»). Строка — точное совпадение, RegExp — test
+    const DEFAULT_WEBDEFAULT_REFS = ['webdefault', /^1xbet/];
+
+    function isWebDefaultRef(ref, refId, patterns) {
+      if (!ref) return refId === '1';
+      return (patterns || DEFAULT_WEBDEFAULT_REFS).some(p => (p instanceof RegExp ? p.test(ref) : normName(p).replace(/ /g, '') === ref));
+    }
+
     function brandFilter(cands, ticket) {
       const ref = normName(ticket.ref).replace(/ /g, '');
       const refId = normSpace(ticket.refId);
       if (!ref && !refId) return { list: cands, matched: false };
       let list;
-      if (ref === 'webdefault' || (!ref && refId === '1')) {
+      if (isWebDefaultRef(ref, refId, ticket.webDefaultRefs)) {
         const explicit = cands.filter(e => e.switchTokens.indexOf('webdefault') !== -1);
         list = explicit.length ? explicit : cands.filter(e => !e.brandTags.length);
       } else {
@@ -618,7 +633,13 @@
         }
       }
       if (!best) return { status: 'nolimit' };
-      const cands = best.cands;
+      // валюта тикета: «Sham Cash» + USD → строка «Sham Cash USD», а не SYP.
+      // Применяется, только если отсекает часть строк и что-то оставляет
+      let cands = best.cands;
+      if (codes.length && cands.length > 1) {
+        const byCur = cands.filter(e => codes.some(c => hasWords(e.norm, c) || hasWords(e.rawNorm, c)));
+        if (byCur.length && byCur.length < cands.length) cands = byCur;
+      }
       const via = best.via;
       const countryMatched = best.countryMatched;
       const brandMatched = best.brandMatched;
@@ -1187,7 +1208,7 @@
 
     const m = Core.matchLimit(limitIndex.entries, overrides, {
       method: rec.method, subagent: rec.subagent, country: rec.country, currency: rec.currency, currencies,
-      ref: rec.ref, refId: rec.refId,
+      ref: rec.ref, refId: rec.refId, webDefaultRefs: CONFIG.webDefaultRefs,
     });
     rec.brandMatched = !!m.brandMatched;
     rec.matchedBy = m.via || '';
