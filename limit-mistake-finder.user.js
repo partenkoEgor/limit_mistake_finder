@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.2
+// @version      1.3
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.2';
+  const VERSION = '1.3';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -344,6 +344,34 @@
       ecuador: ['ecuador', 'эквадор'],
       bolivia: ['bolivia', 'боливия'],
       venezuela: ['venezuela', 'венесуэла'],
+      paraguay: ['paraguay', 'парагвай'],
+      uruguay: ['uruguay', 'уругвай'],
+      nicaragua: ['nicaragua', 'никарагуа'],
+      panama: ['panama', 'панама'],
+      honduras: ['honduras', 'гондурас'],
+      guatemala: ['guatemala', 'гватемала'],
+      costarica: ['costa rica', 'коста рика'],
+      elsalvador: ['el salvador', 'сальвадор'],
+      dominican: ['dominican republic', 'доминиканская республика', 'доминикана'],
+      jamaica: ['jamaica', 'ямайка'],
+      haiti: ['haiti', 'гаити'],
+      trinidad: ['trinidad and tobago', 'trinidad', 'тринидад и тобаго', 'тринидад'],
+      belize: ['belize', 'белиз'],
+      canada: ['canada', 'канада'],
+      usa: ['united states', 'usa', 'сша'],
+      malawi: ['malawi', 'малави'],
+      mozambique: ['mozambique', 'мозамбик'],
+      zimbabwe: ['zimbabwe', 'зимбабве'],
+      botswana: ['botswana', 'ботсвана'],
+      namibia: ['namibia', 'намибия'],
+      sierraleone: ['sierra leone', 'сьерра леоне'],
+      liberia: ['liberia', 'либерия'],
+      gambia: ['gambia', 'гамбия'],
+      madagascar: ['madagascar', 'мадагаскар'],
+      taiwan: ['taiwan', 'тайвань'],
+      hongkong: ['hong kong', 'гонконг'],
+      singapore: ['singapore', 'сингапур'],
+      laos: ['laos', 'лаос'],
       // Европа
       cyprus: ['cyprus', 'кипр'],
     };
@@ -453,17 +481,20 @@
       const nc = n.replace(/ /g, '');
       tiers.push(entries.filter(e => e.compacts.indexOf(nc) !== -1)); // «L'bankalik» = «Lbankalik»
       if (n.length >= 4) {
-        let best = 0;
+        // по уровню на каждую длину названия, от самых длинных: если
+        // «Al Barid Bank (BizBet)» чужого проекта, следующим уровнем
+        // проверяется «Al Barid»
         const inner = [];
         entries.forEach(e => {
           const len = e.aliases
             .filter(x => x.length >= 4 && hasWords(n, x))
             .reduce((m, x) => Math.max(m, x.length), 0);
-          if (!len) return;
-          inner.push({ e, len });
-          best = Math.max(best, len);
+          if (len) inner.push({ e, len });
         });
-        tiers.push(inner.filter(x => x.len === best).map(x => x.e));
+        inner.map(x => x.len)
+          .filter((l, i, arr) => arr.indexOf(l) === i)
+          .sort((a, b) => b - a)
+          .forEach(l => tiers.push(inner.filter(x => x.len === l).map(x => x.e)));
         tiers.push(entries.filter(e => e.aliases.some(x => hasWords(x, n))));
       }
       return tiers.filter(t => t.length);
@@ -1282,8 +1313,8 @@
     }
 
     const num = v => (v == null || v === '' ? '' : Number(v));
-    const vHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Ref', 'Amount by receipt', 'Валюта', 'Min', 'Max', 'Отклонение', 'Country', 'User ID', 'Status', 'Метод в Confluence', 'Страна (Confluence)', 'Страна совпала', 'Лимит (как в Confluence)'];
-    const vRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, r.ref, num(r.amount), r.currency, num(r.min), num(r.max), num(r.diff), r.country, r.userId, r.status, r.limitName, r.limitCountry, r.countryMatched ? 'да' : 'нет', r.limitRaw];
+    const vHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Ref', 'Amount by receipt', 'Валюта', 'Min', 'Max', 'Отклонение', 'Country', 'User ID', 'Status', 'Метод в Confluence', 'Страна (Confluence)', 'Страна совпала', 'Проект совпал', 'Лимит (как в Confluence)'];
+    const vRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, r.ref, num(r.amount), r.currency, num(r.min), num(r.max), num(r.diff), r.country, r.userId, r.status, r.limitName, r.limitCountry, r.countryMatched ? 'да' : 'нет', r.brandMatched ? 'да' : 'нет', r.limitRaw];
     const uHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Ref', 'Amount by receipt', 'Валюта', 'Country', 'User ID', 'Status', 'Причина'];
     const uRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, r.ref, r.amount == null ? Core.normSpace(r.amountRaw) : r.amount, r.currency, r.country, r.userId, r.status, r.reason];
 
@@ -1398,15 +1429,16 @@
       const overrides = Core.normOverrides(CONFIG.limitOverrides);
       const sample = rows.filter(r => isWantedStatus(r[det.keys.status])).slice(0, 10);
       out.push(`Проверка сопоставления — тикеты ${CONFIG.statuses.join(', ')} со стр. 1 (до 10 шт., найдено ${sample.length}):`);
+      out.push('  (формат: #тикет | method | subagent | страна | проект | сумма)');
       if (!sample.length) out.push('  на странице нет тикетов в этом статусе');
       const verdicts = { below: 'НИЖЕ лимита', above: 'ВЫШЕ лимита', ok: 'в лимите' };
       sample.forEach(r => {
         const { rec, verdict } = checkRow(r, overrides);
-        const head = `  #${rec.ticketId} | ${rec.method || '—'} | ${rec.country || '—'} | ${rec.ref || '—'} | ${fmtNum(rec.amount)} ${rec.currency}`;
+        const head = `  #${rec.ticketId} | ${rec.method || '—'} | ${rec.subagent || '—'} | ${rec.country || '—'} | ${rec.ref || '—'} | ${fmtNum(rec.amount)} ${rec.currency}`;
         if (verdict === 'unchecked') {
           out.push(`${head}\n      → не проверен: ${rec.reason}`);
         } else {
-          out.push(`${head}\n      → «${rec.limitName}» [${rec.limitCountry}${rec.countryMatched ? '' : ', страна НЕ совпала'}${rec.brandMatched ? `, проект ${rec.ref || rec.refId} совпал` : ''}] `
+          out.push(`${head}\n      → «${rec.limitName}» [${rec.limitCountry}${rec.countryMatched ? '' : ', страна НЕ совпала'}${rec.brandMatched ? `, проект ${rec.ref || rec.refId} совпал` : (rec.ref || rec.refId ? ', проект НЕ совпал' : '')}] `
             + `min ${fmtNum(rec.min)} – max ${fmtNum(rec.max)} (по ${rec.matchedBy}) → ${verdicts[verdict]}`);
         }
       });
@@ -1531,7 +1563,7 @@
         <td class="num">${fmtNum(r.max)}</td>
         <td class="num ${kind === 'below' ? 'neg' : 'pos'}">${r.diff > 0 ? '+' : ''}${fmtNum(r.diff)}</td>
         <td>${esc(r.country)}</td>
-        <td>${esc(r.limitName)}<div class="muted">${esc(r.limitCountry)}${r.countryMatched ? '' : ' <span class="warn">⚠ страна не совпала</span>'}</div></td>
+        <td>${esc(r.limitName)}<div class="muted">${esc(r.limitCountry)}${r.countryMatched ? '' : ' <span class="warn">⚠ страна не совпала</span>'}${(r.ref || r.refId) && !r.brandMatched ? ' <span class="warn">⚠ проект не совпал</span>' : ''}</div></td>
       </tr>`).join('');
     return `<table><thead><tr><th>№</th><th>Ticket ID</th><th>Method / Subagent</th><th>Amount by receipt</th><th>Min</th><th>Max</th><th>Отклонение</th><th>Country</th><th>Строка Confluence</th></tr></thead><tbody>${rows}</tbody></table>`;
   }
