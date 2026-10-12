@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.6
+// @version      1.7
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.6';
+  const VERSION = '1.7';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -54,6 +54,7 @@
       subagent: null,
       ref: null,
       refId: null,
+      subagentId: null,
       country: null,
       userId: null,
       currency: null,
@@ -222,7 +223,7 @@
 
     const COL_MIN_RE = /(^| )(min|minimum|мин|минимум|минимальн\S*|от)( |$)/;
     const COL_MAX_RE = /(^| )(max|maximum|макс|максимум|максимальн\S*|до)( |$)/;
-    const COL_SKIP_RE = /вывод|withdraw|payout|коммент|comment|примеч|note|контакт|contact|ссылк|link|комисс|fee|переключ|доп|настройк|страна|country/;
+    const COL_SKIP_RE = /вывод|withdraw|payout|коммент|comment|примеч|note|контакт|contact|ссылк|link|комисс|fee|переключ|доп|настройк|страна|country|субы|субагенты|subs/;
     const COL_LIMIT_RE = /лимит|limit|min|max|мин|макс|сумм|amount|range|диапазон|депозит|deposit/;
     const COL_COUNTRY_RE = /страна|country/;
     const HEADER_FIRST_CELL_RE = /^(метод|методы|method|methods|субагент|subagent|name|название|наименование)$/;
@@ -395,6 +396,52 @@
 
     // tables: [{ heading, headers:[], rows:[{ cells:[text], striked }] }]
     const COL_SWITCH_RE = /переключ|switch/;
+    const COL_SUBS_RE = /(^| )(субы|субагенты|subs|subagents)( |$)/;
+
+    // Ячейка «Субы»: список субагентов строки и блоки «исключения по
+    // лимитам (500-30000 KGS): <субы>» со своим лимитом. Читается из
+    // Confluence при каждой загрузке — ничего не зашито в скрипт.
+    function subItem(line) {
+      const norm = normName(line);
+      if (!norm || !/[a-zа-яё]{2}/.test(norm)) return null;
+      const m = norm.match(/^(.*?)(?: (\d{3,}))?$/);
+      return { norm, base: m[1].trim(), id: m[2] || '' };
+    }
+
+    function parseSubsCell(text) {
+      const lines = String(text || '').split('\n').map(normSpace).filter(Boolean);
+      const out = { subs: [], exceptions: [] };
+      let cur = null;
+      for (let i = 0; i < lines.length; i++) {
+        const line = lines[i];
+        if (/исключени|exception/i.test(line)) {
+          let hdr = line;
+          let lim = parseLimitText(hdr);
+          // заголовок мог переноситься на следующую строку: «… (500-30000» / «KGS):»
+          if (lim.min == null && lim.max == null && lines[i + 1]) {
+            const two = line + ' ' + lines[i + 1];
+            const lim2 = parseLimitText(two);
+            if (lim2.min != null || lim2.max != null) { hdr = two; lim = lim2; i++; }
+          }
+          cur = { min: lim.min, max: lim.max, raw: hdr, subs: [] };
+          out.exceptions.push(cur);
+          continue;
+        }
+        // хвост перенесённого заголовка исключения: «KGS):»
+        if (cur && !cur.subs.length && /^[^()]*\)\s*:?\s*$/.test(line)) { cur.raw += ' ' + line; continue; }
+        const item = subItem(line);
+        if (item && item.norm.length >= 4) (cur ? cur.subs : out.subs).push(item);
+      }
+      return out;
+    }
+
+    // Subagent тикета есть в списке? По имени (номер в конце списка не
+    // обязателен) или по ID субагента
+    function subListed(item, sn, sid) {
+      if (sid && item.id === sid) return true;
+      if (!sn) return false;
+      return item.base === sn || item.norm === sn || (sn.length >= 6 && hasWords(item.norm, sn));
+    }
 
     function parenTexts(name) {
       return (String(name).match(/\(([^)]*)\)/g) || []).map(x => normName(x)).filter(Boolean);
@@ -416,6 +463,7 @@
       tables.forEach(tbl => {
         const countryCol = tbl.headers.findIndex((x, i) => i > 0 && COL_COUNTRY_RE.test(normName(x)));
         const switchCol = tbl.headers.findIndex((x, i) => i > 0 && COL_SWITCH_RE.test(normName(x)));
+        const subsCol = tbl.headers.findIndex((x, i) => i > 0 && COL_SUBS_RE.test(normName(x)));
         tbl.rows.forEach(row => {
           const name = normSpace(row.cells[0]);
           if (!name) return;
@@ -457,6 +505,7 @@
             striked: !!row.striked,
             raw: row.cells.slice(1).map(normSpace).filter(Boolean).join(' | '),
             rawNorm: normName(row.cells.slice(1).join(' ')),
+            subsInfo: subsCol > 0 ? parseSubsCell(row.cells[subsCol]) : { subs: [], exceptions: [] },
           });
         });
       });
@@ -644,15 +693,36 @@
       const countryMatched = best.countryMatched;
       const brandMatched = best.brandMatched;
 
+      // колонка «Субы»: исключение со своим лимитом → строка, где указан суб
+      const sn = normName(ticket.subagent);
+      const sid = normSpace(ticket.subagentId);
+      const withSubs = cands.filter(e => e.subsInfo && (e.subsInfo.subs.length || e.subsInfo.exceptions.length));
+      let subMatched = false;
+      if ((sn || sid) && withSubs.length) {
+        for (const e of cands) {
+          for (const ex of (e.subsInfo ? e.subsInfo.exceptions : [])) {
+            if ((ex.min != null || ex.max != null) && ex.subs.some(it => subListed(it, sn, sid))) {
+              return {
+                status: 'ok', via, countryMatched, brandMatched, subMatched: true,
+                limit: Object.assign({}, e, { min: ex.min, max: ex.max, name: e.name + ' — исключение из «Субы»', raw: ex.raw + ' | ' + e.raw }),
+              };
+            }
+          }
+        }
+        const bySub = cands.filter(e => e.subsInfo && e.subsInfo.subs.some(it => subListed(it, sn, sid)));
+        if (bySub.length) { cands = bySub; subMatched = true; }
+      }
+      const subsChecked = withSubs.length > 0 && !subMatched;
+
       const active = cands.filter(e => !e.striked);
       const pool = active.length ? active : cands;
       const parsed = pool.filter(hasLimit);
-      if (!parsed.length) return { status: 'unparsed', entries: pool, via, countryMatched, brandMatched };
+      if (!parsed.length) return { status: 'unparsed', entries: pool, via, countryMatched, brandMatched, subMatched };
       const distinct = {};
       parsed.forEach(e => { if (!distinct[e.min + '|' + e.max]) distinct[e.min + '|' + e.max] = e; });
       const keys = Object.keys(distinct);
-      if (keys.length > 1) return { status: 'ambiguous', entries: parsed, via, countryMatched, brandMatched };
-      return { status: 'ok', limit: distinct[keys[0]], via, countryMatched, brandMatched };
+      if (keys.length > 1) return { status: 'ambiguous', entries: parsed, via, countryMatched, brandMatched, subMatched, subsChecked };
+      return { status: 'ok', limit: distinct[keys[0]], via, countryMatched, brandMatched, subMatched };
     }
 
     // → { verdict: 'below'|'above'|'ok', diff }
@@ -719,6 +789,11 @@
         keys: ['nameRef', 'refName', 'nameProject'],
         pats: [[/ref/i, /name/i]],
         valid: isText,
+      },
+      subagentId: {
+        keys: ['subAgenId', 'subAgentId', 'idSubagent', 'idSubAgent', 'subagentId'],
+        pats: [[/^sub_?agen_?t?_?id$/i], [/^id_?sub_?agent$/i]],
+        valid: v => /^\d+$/.test(String(v == null ? '' : v).trim()),
       },
       refId: {
         keys: ['refId', 'idRef', 'ref_id'],
@@ -804,7 +879,7 @@
 
     return {
       normSpace, normStatus, normName, parseAmount, parseNumberToken, extractNumbers,
-      parseLimitText, parseLimitRow, isHeaderRow, countryKeys, buildQueries, findCandidates, brandFilter,
+      parseLimitText, parseLimitRow, parseSubsCell, isHeaderRow, countryKeys, buildQueries, findCandidates, brandFilter,
       buildLimitIndex, normOverrides, matchLimit, evaluate,
       flattenRow, rankedKeys, detectKey, valuesEqual, pickKeyByValues, FIELD_DEFS,
     };
@@ -1191,6 +1266,7 @@
       subagent: val(k.subagent),
       ref: val(k.ref),
       refId: val(k.refId),
+      subagentId: val(k.subagentId),
       amountRaw: row[k.amount],
       amount: Core.parseAmount(row[k.amount]),
       currency: val(k.currency),
@@ -1208,12 +1284,17 @@
 
     const m = Core.matchLimit(limitIndex.entries, overrides, {
       method: rec.method, subagent: rec.subagent, country: rec.country, currency: rec.currency, currencies,
-      ref: rec.ref, refId: rec.refId, webDefaultRefs: CONFIG.webDefaultRefs,
+      ref: rec.ref, refId: rec.refId, webDefaultRefs: CONFIG.webDefaultRefs, subagentId: rec.subagentId,
     });
     rec.brandMatched = !!m.brandMatched;
+    rec.subMatched = !!m.subMatched;
+    if (m.status === 'ambiguous' && m.subsChecked) {
+      m.reasonExtra = `Субагента «${rec.subagent}» нет в колонке «Субы» ни одной из строк`;
+    }
     rec.matchedBy = m.via || '';
     if (m.status !== 'ok') {
       rec.reason = UNCHECKED_REASONS[m.status] || m.status;
+      if (m.reasonExtra) rec.reason += ` (${m.reasonExtra})`;
       if (m.entries && m.entries.length) {
         rec.reason += ': ' + m.entries.slice(0, 4)
           .map(e => `«${e.name}» (${e.country || '?'}) ${e.raw}`.slice(0, 160)).join(' ; ');
@@ -1457,6 +1538,12 @@
       out.push('Примеры распознанных строк:');
       parsed.slice(0, 8).forEach(e => out.push(`  ${e.name} [${e.country}] → min ${fmtNum(e.min)}, max ${fmtNum(e.max)}${e.striked ? ' (зачёркнута)' : ''}`));
       out.push(`Бренды (для выбора строки по nameRef): ${(li.entries.brands || []).join(', ') || '—'}`);
+      const withSubs = li.entries.filter(e => e.subsInfo && (e.subsInfo.subs.length || e.subsInfo.exceptions.length));
+      const exCount = withSubs.reduce((n, e) => n + e.subsInfo.exceptions.length, 0);
+      out.push(`Строк с колонкой «Субы»: ${withSubs.length}, блоков исключений по лимитам: ${exCount}`);
+      withSubs.filter(e => e.subsInfo.exceptions.length).slice(0, 5).forEach(e => e.subsInfo.exceptions.forEach(ex => {
+        out.push(`  «${e.name}» [${e.country}]: исключение min ${fmtNum(ex.min)} – max ${fmtNum(ex.max)}, субов: ${ex.subs.length}`);
+      }));
       const noCountry = li.tables.filter(t => {
         const ci = t.headers.findIndex((x, i) => i > 0 && /страна|country/i.test(x));
         const cells = ci > 0 ? t.rows.map(r => r.cells[ci] || '').join(' ') : '';
@@ -1491,7 +1578,7 @@
         if (verdict === 'unchecked') {
           out.push(`${head}\n      → не проверен: ${rec.reason}`);
         } else {
-          out.push(`${head}\n      → «${rec.limitName}» [${rec.limitCountry}${rec.countryMatched ? '' : ', страна НЕ совпала'}${rec.brandMatched ? `, проект ${rec.ref || rec.refId} совпал` : (rec.ref || rec.refId ? ', проект НЕ совпал' : '')}] `
+          out.push(`${head}\n      → «${rec.limitName}» [${rec.limitCountry}${rec.countryMatched ? '' : ', страна НЕ совпала'}${rec.brandMatched ? `, проект ${rec.ref || rec.refId} совпал` : (rec.ref || rec.refId ? ', проект НЕ совпал' : '')}${rec.subMatched ? ', суб найден в «Субы»' : ''}] `
             + `min ${fmtNum(rec.min)} – max ${fmtNum(rec.max)} (по ${rec.matchedBy}) → ${verdicts[verdict]}`);
         }
       });
