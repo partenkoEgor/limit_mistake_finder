@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.10
+// @version      1.11
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.10';
+  const VERSION = '1.11';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -87,7 +87,7 @@
     // Проекты (nameRef), которые считаются webDefault: строка — точное
     // совпадение после нормализации, RegExp — по шаблону. «1xbet22.com» →
     // «1xbet22com» подходит под /^1xbet/
-    webDefaultRefs: ['webdefault', /^1xbet/],
+    webDefaultRefs: ['webdefault', /1xbet/],
 
     // Пауза между страницами списка (мс)
     pageDelay: 400,
@@ -652,7 +652,7 @@
     // другой проект — строки с его названием или refId в «Переключалке».
     // Проекты, которые считаются webDefault: сам webDefault и зеркала 1xbet
     // («1xbet22.com» → «1xbet22com»). Строка — точное совпадение, RegExp — test
-    const DEFAULT_WEBDEFAULT_REFS = ['webdefault', /^1xbet/];
+    const DEFAULT_WEBDEFAULT_REFS = ['webdefault', /1xbet/];
 
     function isWebDefaultRef(ref, refId, patterns) {
       if (!ref) return refId === '1';
@@ -663,19 +663,47 @@
       const ref = normName(ticket.ref).replace(/ /g, '');
       const refId = normSpace(ticket.refId);
       if (!ref && !refId) return { list: cands, matched: false };
-      let list;
       const isProject = e => e.brandTags.length > 0 || (e.refIds || []).length > 0;
-      if (isWebDefaultRef(ref, refId, ticket.webDefaultRefs)) {
-        // «webdefault» или «default» в «Переключалке» («jibi default») —
-        // явная строка webDefault, если она не из таблицы другого проекта
+      // «webdefault» или «default» в «Переключалке» («jibi default») —
+      // явная строка webDefault, если она не из таблицы другого проекта
+      const webDefaultRows = () => {
         const plain = cands.filter(e => !isProject(e));
         const explicit = plain.filter(e => e.switchTokens.indexOf('webdefault') !== -1 || e.switchTokens.indexOf('default') !== -1);
-        list = explicit.length ? explicit : plain;
-      } else {
-        list = cands.filter(e => (ref && (e.brandTags.indexOf(ref) !== -1 || e.compact.indexOf(ref) !== -1))
-          || (refId && (e.switchTokens.indexOf(refId) !== -1 || (e.refIds || []).indexOf(refId) !== -1)));
+        return explicit.length ? explicit : plain;
+      };
+      if (isWebDefaultRef(ref, refId, ticket.webDefaultRefs)) {
+        const list = webDefaultRows();
+        return list.length ? { list, matched: true } : { list: cands, matched: false };
       }
-      return list.length ? { list, matched: true } : { list: cands, matched: false };
+      const list = cands.filter(e => (ref && (e.brandTags.indexOf(ref) !== -1 || e.compact.indexOf(ref) !== -1))
+        || (refId && (e.switchTokens.indexOf(refId) !== -1 || (e.refIds || []).indexOf(refId) !== -1)));
+      if (list.length) return { list, matched: true };
+      // у проекта нет своей строки — берём webDefault (проект не совпал →
+      // при сумме в лимите тикет уйдёт в «Проверить вручную»)
+      const fallback = webDefaultRows();
+      return { list: fallback.length ? fallback : cands, matched: false };
+    }
+
+    // Строки, название которых целиком есть в Subagent (самые длинные):
+    // «Arcturus CLIQ Jordan» → «Cliq». Только с распознанным лимитом и
+    // только в стране тикета
+    function subagentNamedRows(entries, ticket, codes, tk, tn) {
+      const sn = normName(ticket.subagent);
+      if (!sn || !tn) return null;
+      let bestLen = 0;
+      const inner = [];
+      entries.forEach(e => {
+        const len = e.aliases
+          .filter(a => a.length >= 3 && !isStopName(a, codes) && GENERIC_WORDS.indexOf(a) === -1 && hasWords(sn, a))
+          .reduce((m, a) => Math.max(m, a.length), 0);
+        if (len) { inner.push({ e, len }); bestLen = Math.max(bestLen, len); }
+      });
+      const list = inner.filter(x => x.len === bestLen).map(x => x.e)
+        .filter(e => (tk.length ? tk.some(k => e.countryKeys.indexOf(k) !== -1) : hasWords(e.countryText, tn)));
+      if (!list.length) return null;
+      const bf = brandFilter(list, ticket);
+      if (!bf.list.some(hasLimit)) return null;
+      return { cands: bf.list, countryMatched: true, brandMatched: bf.matched };
     }
 
     // ticket: { method, subagent, country, currency, ref, refId } (или строка)
@@ -729,6 +757,17 @@
         if (best && best.score >= maxScore) break;
       }
       if (!best) return { status: 'nolimit' };
+
+      // Subagent прямо называет метод («Arcturus CLIQ Jordan» → «Cliq»), а
+      // method указывает на другую строку («Bank al Etihad») — важнее Subagent
+      let info = '';
+      const subRows = subagentNamedRows(entries, ticket, codes, tk, tn);
+      if (subRows && normSpace(ticket.method) && best.via === 'method'
+          && !subRows.cands.some(e => best.cands.indexOf(e) !== -1)
+          && (subRows.brandMatched || !best.brandMatched) && (subRows.countryMatched || !best.countryMatched)) {
+        info = `лимит по Subagent: method «${normSpace(ticket.method)}» указывает на «${best.cands[0].name}»`;
+        best = { cands: subRows.cands, via: 'subagent', countryMatched: subRows.countryMatched, brandMatched: subRows.brandMatched };
+      }
       // валюта тикета: «Sham Cash» + USD → строка «Sham Cash USD», а не SYP.
       // Применяется, только если отсекает часть строк и что-то оставляет
       let cands = best.cands;
@@ -818,12 +857,12 @@
       const active = cands.filter(e => !e.striked);
       const pool = active.length ? active : cands;
       const parsed = pool.filter(hasLimit);
-      if (!parsed.length) return { status: 'unparsed', entries: pool, via, countryMatched, brandMatched, subMatched, note };
+      if (!parsed.length) return { status: 'unparsed', entries: pool, via, countryMatched, brandMatched, subMatched, note, info };
       const distinct = {};
       parsed.forEach(e => { if (!distinct[e.min + '|' + e.max]) distinct[e.min + '|' + e.max] = e; });
       const keys = Object.keys(distinct);
-      if (keys.length > 1) return { status: 'ambiguous', entries: parsed, via, countryMatched, brandMatched, subMatched, subsChecked, note };
-      return { status: 'ok', limit: distinct[keys[0]], via, countryMatched, brandMatched, subMatched, note };
+      if (keys.length > 1) return { status: 'ambiguous', entries: parsed, via, countryMatched, brandMatched, subMatched, subsChecked, note, info };
+      return { status: 'ok', limit: distinct[keys[0]], via, countryMatched, brandMatched, subMatched, note, info };
     }
 
     // → { verdict: 'below'|'above'|'ok', diff }
@@ -1391,6 +1430,7 @@
     rec.brandMatched = !!m.brandMatched;
     rec.subMatched = !!m.subMatched;
     rec.note = m.note || '';
+    rec.info = m.info || ''; // справка, на ручную проверку не отправляет
     if (m.status === 'ambiguous' && m.subsChecked) {
       m.reasonExtra = `Субагента «${rec.subagent}» нет в колонке «Субы» ни одной из строк`;
     }
@@ -1560,7 +1600,7 @@
 
     const num = v => (v == null || v === '' ? '' : Number(v));
     const vHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Ref', 'Amount by receipt', 'Валюта', 'Min', 'Max', 'Отклонение', 'Country', 'User ID', 'Status', 'Метод в Confluence', 'Страна (Confluence)', 'Страна совпала', 'Проект совпал', 'Лимит (как в Confluence)', 'Примечание'];
-    const vRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, r.ref, num(r.amount), r.currency, num(r.min), num(r.max), num(r.diff), r.country, r.userId, r.status, r.limitName, r.limitCountry, r.countryMatched ? 'да' : 'нет', r.brandMatched ? 'да' : 'нет', r.limitRaw, r.note];
+    const vRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, r.ref, num(r.amount), r.currency, num(r.min), num(r.max), num(r.diff), r.country, r.userId, r.status, r.limitName, r.limitCountry, r.countryMatched ? 'да' : 'нет', r.brandMatched ? 'да' : 'нет', r.limitRaw, [r.note, r.info].filter(Boolean).join('; ')];
     const uHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Ref', 'Amount by receipt', 'Валюта', 'Country', 'User ID', 'Status', 'Причина'];
     const uRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, r.ref, r.amount == null ? Core.normSpace(r.amountRaw) : r.amount, r.currency, r.country, r.userId, r.status, r.reason];
 
