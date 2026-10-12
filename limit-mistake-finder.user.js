@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.0
-// @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами субагента со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
+// @version      1.1
+// @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://managment.io/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.0';
+  const VERSION = '1.1';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -45,10 +45,12 @@
     // receipt / Status), потом по названию ключа. Если «Диагностика»
     // показала, что поле определилось неверно, впишите ключ сюда,
     // например amount: 'amountByReceipt'.
+    // amount — это Amount by receipt (подтверждено); summa — сумма транзакции.
     fields: {
       ticketId: null,
       status: null,
-      amount: null,
+      amount: 'amount',
+      method: null,
       subagent: null,
       country: null,
       userId: null,
@@ -61,14 +63,15 @@
       ticketId: ['ticket id'],
       status: ['external status', 'status'],
       amount: ['amount by receipt'],
+      method: ['method'],
       subagent: ['subagent'],
       country: ['country'],
       userId: ['user id'],
     },
 
-    // Ручные лимиты: перекрывают Confluence. Ключ — название субагента
+    // Ручные лимиты: перекрывают Confluence. Ключ — method или subagent
     // (как в тикете), значение — { min, max } (любую границу можно не
-    // указывать). Пример: 'Vodafone Cash': { min: 100, max: 30000 },
+    // указывать). Пример: 'Sham Cash SYP': { min: 100, max: 30000 },
     limitOverrides: {
     },
 
@@ -189,8 +192,18 @@
 
     const COL_MIN_RE = /(^| )(min|minimum|мин|минимум|минимальн\S*|от)( |$)/;
     const COL_MAX_RE = /(^| )(max|maximum|макс|максимум|максимальн\S*|до)( |$)/;
-    const COL_SKIP_RE = /вывод|withdraw|payout|коммент|comment|примеч|note|контакт|contact|ссылк|link|комисс|fee/;
+    const COL_SKIP_RE = /вывод|withdraw|payout|коммент|comment|примеч|note|контакт|contact|ссылк|link|комисс|fee|переключ|доп|настройк|страна|country/;
     const COL_LIMIT_RE = /лимит|limit|min|max|мин|макс|сумм|amount|range|диапазон|депозит|deposit/;
+    const COL_COUNTRY_RE = /страна|country/;
+    const HEADER_FIRST_CELL_RE = /^(метод|методы|method|methods|субагент|subagent|name|название|наименование)$/;
+
+    // Строка заголовков таблицы Confluence: первая ячейка — «Метод» и т.п.,
+    // либо (для первой строки таблицы) в строке нет ни одной цифры
+    function isHeaderRow(cells, isFirst) {
+      if (!cells.length) return false;
+      if (HEADER_FIRST_CELL_RE.test(normName(cells[0]))) return true;
+      return !!isFirst && cells.length >= 2 && cells.every(c => !/\d/.test(c));
+    }
 
     // Строка таблицы Confluence → { min, max }
     function parseLimitRow(headers, cells) {
@@ -222,24 +235,73 @@
       return { min: null, max: null };
     }
 
+    // ── Страны: название в тикете (англ.) ↔ таблица/колонка в Confluence ──
+    const COUNTRY_ALIASES = {
+      morocco: ['morocco', 'марокко', 'maroc'],
+      egypt: ['egypt', 'египет'],
+      uae: ['uae', 'united arab emirates', 'оаэ', 'эмираты', 'объединенные арабские эмираты'],
+      somalia: ['somalia', 'сомали'],
+      lebanon: ['lebanon', 'ливан'],
+      syria: ['syria', 'сирия', 'syrian arab republic'],
+      iraq: ['iraq', 'ирак'],
+      jordan: ['jordan', 'иордания'],
+      saudi: ['saudi arabia', 'ksa', 'саудовская аравия', 'сауд аравия', 'саудия'],
+      kuwait: ['kuwait', 'кувейт'],
+      qatar: ['qatar', 'катар'],
+      bahrain: ['bahrain', 'бахрейн'],
+      oman: ['oman', 'оман'],
+      yemen: ['yemen', 'йемен'],
+      libya: ['libya', 'ливия'],
+      tunisia: ['tunisia', 'тунис'],
+      algeria: ['algeria', 'алжир'],
+      sudan: ['sudan', 'судан'],
+      palestine: ['palestine', 'палестина'],
+      mauritania: ['mauritania', 'мавритания'],
+      djibouti: ['djibouti', 'джибути'],
+      turkey: ['turkey', 'turkiye', 'турция'],
+      iran: ['iran', 'иран'],
+      afghanistan: ['afghanistan', 'афганистан'],
+      pakistan: ['pakistan', 'пакистан'],
+      bangladesh: ['bangladesh', 'бангладеш'],
+      india: ['india', 'индия'],
+    };
+
+    function hasWords(text, words) {
+      return (' ' + text + ' ').indexOf(' ' + words + ' ') !== -1;
+    }
+
+    // Текст → набор канонических стран, которые в нём упомянуты
+    function countryKeys(text) {
+      const n = normName(text);
+      if (!n) return [];
+      return Object.keys(COUNTRY_ALIASES).filter(k => COUNTRY_ALIASES[k].some(a => hasWords(n, normName(a))));
+    }
+
     // tables: [{ heading, headers:[], rows:[{ cells:[text], striked }] }]
     function buildLimitIndex(tables) {
       const entries = [];
       tables.forEach(tbl => {
+        const countryCol = tbl.headers.findIndex((x, i) => i > 0 && COL_COUNTRY_RE.test(normName(x)));
         tbl.rows.forEach(row => {
           const name = normSpace(row.cells[0]);
           if (!name) return;
           const norm = normName(name);
           if (!norm) return;
+          if (HEADER_FIRST_CELL_RE.test(norm)) return; // повтор строки заголовков
           const parts = String(row.cells[0]).split(/[\n,;/|]+/).map(normName).filter(Boolean);
           const lim = parseLimitRow(tbl.headers, row.cells);
+          const countryCell = countryCol > 0 ? normSpace(row.cells[countryCol]) : '';
+          const heading = tbl.heading || '';
           entries.push({
             name,
             norm,
             parts,
             min: lim.min,
             max: lim.max,
-            heading: tbl.heading || '',
+            heading,
+            country: countryCell || heading,
+            countryText: normName(countryCell + ' ' + heading),
+            countryKeys: countryKeys(countryCell + ' ' + heading),
             striked: !!row.striked,
             raw: row.cells.slice(1).map(normSpace).filter(Boolean).join(' | '),
           });
@@ -262,30 +324,95 @@
 
     function hasLimit(e) { return e.min != null || e.max != null; }
 
-    // → { status: 'ok'|'nolimit'|'unparsed'|'ambiguous'|'nosubagent', limit, entries }
-    function matchLimit(entries, overrides, subagent) {
-      const n = normName(subagent);
-      if (!n) return { status: 'nosubagent' };
-      if (overrides && overrides[n]) {
-        const o = overrides[n];
-        return { status: 'ok', limit: { name: subagent, min: o.min, max: o.max, heading: 'CONFIG.limitOverrides', raw: '' } };
+    // Строки Confluence для одного варианта названия: точное → часть
+    // ячейки → вхождение целыми словами (самые длинные названия)
+    function findCandidates(entries, n) {
+      const exact = entries.filter(e => e.norm === n);
+      if (exact.length) return exact;
+      const parts = entries.filter(e => e.parts.indexOf(n) !== -1);
+      if (parts.length) return parts;
+      if (n.length < 4) return [];
+      // название из Confluence целиком входит в название из тикета:
+      // «sham cash» в «sham cash syp» — берём самые длинные (конкретные)
+      let best = 0;
+      const inner = [];
+      entries.forEach(e => {
+        const len = [e.norm].concat(e.parts)
+          .filter(a => a.length >= 4 && hasWords(n, a))
+          .reduce((m, a) => Math.max(m, a.length), 0);
+        if (!len) return;
+        inner.push({ e, len });
+        best = Math.max(best, len);
+      });
+      if (inner.length) return inner.filter(x => x.len === best).map(x => x.e);
+      // название из тикета входит в название из Confluence
+      return entries.filter(e => [e.norm].concat(e.parts).some(a => hasWords(a, n)));
+    }
+
+    // Варианты названия для поиска: method, method без кода валюты, subagent
+    function buildQueries(ticket) {
+      const out = [];
+      const add = (text, via) => {
+        const n = normName(text);
+        if (n && !out.some(q => q.n === n)) out.push({ n, via, text: normSpace(text) });
+      };
+      const codes = [ticket.currency].concat(ticket.currencies || [])
+        .map(c => normSpace(c).toLowerCase()).filter(Boolean);
+      add(ticket.method, 'method');
+      if (normSpace(ticket.method)) {
+        const stripped = normSpace(ticket.method).split(' ')
+          .filter(w => !/^[A-Z]{3}$/.test(w) && codes.indexOf(w.toLowerCase()) === -1)
+          .join(' ');
+        add(stripped, 'method');
       }
-      const tiers = [
-        entries.filter(e => e.norm === n),
-        entries.filter(e => e.parts.indexOf(n) !== -1),
-        entries.filter(e => e.norm.indexOf(n) !== -1 || (e.norm.length >= 4 && n.indexOf(e.norm) !== -1)),
-      ];
-      const tier = tiers.find(t => t.length);
-      if (!tier) return { status: 'nolimit' };
-      const active = tier.filter(e => !e.striked);
-      const pool = active.length ? active : tier;
+      add(ticket.subagent, 'subagent');
+      return out;
+    }
+
+    // ticket: { method, subagent, country, currency } (или просто строка)
+    // → { status: 'ok'|'nolimit'|'unparsed'|'ambiguous'|'nosubagent',
+    //     limit, entries, via, countryMatched }
+    function matchLimit(entries, overrides, ticket) {
+      if (typeof ticket === 'string') ticket = { subagent: ticket };
+      const queries = buildQueries(ticket);
+      if (!queries.length) return { status: 'nosubagent' };
+      for (const q of queries) {
+        if (overrides && overrides[q.n]) {
+          const o = overrides[q.n];
+          return {
+            status: 'ok', via: q.via, countryMatched: true,
+            limit: { name: q.text, min: o.min, max: o.max, heading: 'CONFIG.limitOverrides', country: '', raw: '' },
+          };
+        }
+      }
+      let cands = null;
+      let via = '';
+      for (const q of queries) {
+        const c = findCandidates(entries, q.n);
+        if (c.length) { cands = c; via = q.via; break; }
+      }
+      if (!cands) return { status: 'nolimit' };
+
+      // уточнение по стране тикета
+      let countryMatched = false;
+      const tk = countryKeys(ticket.country);
+      const tn = normName(ticket.country);
+      if (tn) {
+        const byCountry = cands.filter(e => (tk.length
+          ? tk.some(k => e.countryKeys.indexOf(k) !== -1)
+          : hasWords(e.countryText, tn)));
+        if (byCountry.length) { cands = byCountry; countryMatched = true; }
+      }
+
+      const active = cands.filter(e => !e.striked);
+      const pool = active.length ? active : cands;
       const parsed = pool.filter(hasLimit);
-      if (!parsed.length) return { status: 'unparsed', entries: pool };
+      if (!parsed.length) return { status: 'unparsed', entries: pool, via, countryMatched };
       const distinct = {};
-      parsed.forEach(e => { distinct[e.min + '|' + e.max] = e; });
+      parsed.forEach(e => { if (!distinct[e.min + '|' + e.max]) distinct[e.min + '|' + e.max] = e; });
       const keys = Object.keys(distinct);
-      if (keys.length > 1) return { status: 'ambiguous', entries: parsed };
-      return { status: 'ok', limit: distinct[keys[0]] };
+      if (keys.length > 1) return { status: 'ambiguous', entries: parsed, via, countryMatched };
+      return { status: 'ok', limit: distinct[keys[0]], via, countryMatched };
     }
 
     // → { verdict: 'below'|'above'|'ok', diff }
@@ -334,9 +461,14 @@
         valid: isText,
       },
       amount: {
-        keys: ['amountByReceipt', 'amount_by_receipt', 'amountReceipt', 'receiptAmount', 'sumByReceipt', 'sumReceipt'],
+        keys: ['amountByReceipt', 'amount_by_receipt', 'amountReceipt', 'receiptAmount', 'sumByReceipt', 'sumReceipt', 'amount'],
         pats: [[/receipt/i, /amount|sum/i], [/amount/i], [/^sum/i]],
         valid: v => v !== '' && v != null && typeof v !== 'boolean' && parseAmount(v) != null,
+      },
+      method: {
+        keys: ['method', 'nameMethod', 'methodName', 'paymentMethod', 'namePaymentMethod'],
+        pats: [[/method/i, /name/i], [/method/i]],
+        valid: isText,
       },
       subagent: {
         keys: ['nameSubagent', 'subagentName', 'nameSubAgent', 'subAgentName', 'nameQuerySubagent', 'subagent', 'subAgent'],
@@ -354,7 +486,7 @@
         valid: v => /^\d+$/.test(String(v == null ? '' : v).trim()),
       },
       currency: {
-        keys: ['nameCurrency', 'currencyCode', 'codeCurrency', 'currency'],
+        keys: ['currencyKode', 'nameCurrency', 'currencyCode', 'codeCurrency', 'currency'],
         pats: [[/currency/i, /name|code/i], [/currency/i]],
         valid: isText,
       },
@@ -422,7 +554,8 @@
 
     return {
       normSpace, normStatus, normName, parseAmount, parseNumberToken, extractNumbers,
-      parseLimitText, parseLimitRow, buildLimitIndex, normOverrides, matchLimit, evaluate,
+      parseLimitText, parseLimitRow, isHeaderRow, countryKeys, buildQueries, findCandidates,
+      buildLimitIndex, normOverrides, matchLimit, evaluate,
       flattenRow, rankedKeys, detectKey, valuesEqual, pickKeyByValues, FIELD_DEFS,
     };
   })();
@@ -603,20 +736,27 @@
       if (table.parentElement && table.parentElement.closest('table')) return; // вложенные таблицы пропускаем
       const allRows = Array.from(table.querySelectorAll('tr')).filter(tr => tr.closest('table') === table);
       if (!allRows.length) return;
+      const rowCells = tr => Array.from(tr.children).filter(c => /^(TD|TH)$/.test(c.tagName));
+      // Заголовок: строка в <thead>, строка из <th> или первая строка без
+      // цифр / с «Метод» в первой ячейке (в Confluence шапка бывает из <td>)
       let headerRow = allRows.find(tr => tr.closest('thead'));
       if (!headerRow) {
         const first = allRows[0];
-        const cells = first.querySelectorAll('th, td');
-        const thCount = first.querySelectorAll('th').length;
-        headerRow = thCount >= Math.ceil(cells.length / 2) ? first : null;
+        const cells = rowCells(first);
+        const thCount = cells.filter(c => c.tagName === 'TH').length;
+        if (thCount >= Math.ceil(cells.length / 2) || Core.isHeaderRow(cells.map(c => c.textContent.trim()), true)) {
+          headerRow = first;
+        }
       }
-      const headers = headerRow ? Array.from(headerRow.querySelectorAll('th, td')).map(c => c.textContent.trim()) : [];
+      const headers = headerRow ? rowCells(headerRow).map(c => c.textContent.trim()) : [];
       const rows = [];
       allRows.forEach(tr => {
         if (tr === headerRow || tr.closest('thead')) return;
-        const cells = Array.from(tr.children).filter(c => /^(TD|TH)$/.test(c.tagName));
+        const cells = rowCells(tr);
         if (cells.length < 2) return;
-        rows.push({ cells: cells.map(cellText), striked: isStriked(cells[0]) });
+        const texts = cells.map(cellText);
+        if (Core.isHeaderRow(texts, false)) return; // повтор шапки внутри таблицы
+        rows.push({ cells: texts, striked: isStriked(cells[0]) });
       });
       if (rows.length) tables.push({ heading: findHeadingBefore(table, doc), headers, rows });
     });
@@ -780,51 +920,72 @@
   };
 
   const UNCHECKED_REASONS = {
-    nosubagent: 'не указан субагент',
-    nolimit: 'субагент не найден в Confluence',
+    nosubagent: 'у тикета нет ни method, ни subagent',
+    nolimit: 'метод не найден в Confluence',
     unparsed: 'лимит в Confluence не распознан',
     ambiguous: 'несколько строк с разными лимитами',
     noamount: 'не удалось прочитать сумму',
   };
 
-  function processRow(row, overrides) {
-    const k = run.keys;
-    const statusText = row[k.status];
-    const wanted = CONFIG.statuses.map(Core.normStatus);
-    if (wanted.indexOf(Core.normStatus(statusText)) === -1) return;
-    run.matched++;
+  function isWantedStatus(statusText) {
+    return CONFIG.statuses.map(Core.normStatus).indexOf(Core.normStatus(statusText)) !== -1;
+  }
 
+  // Строка списка → запись отчёта + вердикт: 'below'|'above'|'ok'|'unchecked'
+  function checkRow(row, overrides) {
+    const k = run.keys;
+    const val = key => (key ? Core.normSpace(row[key]) : '');
     const rec = {
       ticketId: String(row[k.ticketId] == null ? '' : row[k.ticketId]).trim(),
-      subagent: Core.normSpace(row[k.subagent]),
+      method: val(k.method),
+      subagent: val(k.subagent),
       amountRaw: row[k.amount],
       amount: Core.parseAmount(row[k.amount]),
-      currency: k.currency ? Core.normSpace(row[k.currency]) : '',
-      country: k.country ? Core.normSpace(row[k.country]) : '',
-      userId: k.userId ? Core.normSpace(row[k.userId]) : '',
-      status: Core.normSpace(statusText),
-      min: null, max: null, diff: null, heading: '', limitName: '', limitRaw: '', reason: '',
+      currency: val(k.currency),
+      country: val(k.country),
+      userId: val(k.userId),
+      status: val(k.status),
+      min: null, max: null, diff: null, heading: '', limitName: '', limitCountry: '', limitRaw: '',
+      countryMatched: false, matchedBy: '', reason: '',
     };
+    // все коды валют строки (currencyKode, currencyUserKode…) — чтобы
+    // отрезать их от method: " Sham Cash SYP" → "Sham Cash"
+    const currencies = Object.keys(row)
+      .filter(x => /curr/i.test(x) && /^[a-z]{3}$/i.test(Core.normSpace(row[x])))
+      .map(x => Core.normSpace(row[x]));
 
-    const m = Core.matchLimit(limitIndex.entries, overrides, rec.subagent);
+    const m = Core.matchLimit(limitIndex.entries, overrides, {
+      method: rec.method, subagent: rec.subagent, country: rec.country, currency: rec.currency, currencies,
+    });
+    rec.matchedBy = m.via || '';
     if (m.status !== 'ok') {
       rec.reason = UNCHECKED_REASONS[m.status] || m.status;
       if (m.entries && m.entries.length) {
-        rec.reason += ': ' + m.entries.slice(0, 3).map(e => `«${e.name}» ${e.raw}`.slice(0, 160)).join(' ; ');
+        rec.reason += ': ' + m.entries.slice(0, 4)
+          .map(e => `«${e.name}» (${e.country || '?'}) ${e.raw}`.slice(0, 160)).join(' ; ');
       }
-      run.unchecked.push(rec);
-      return;
+      return { rec, verdict: 'unchecked' };
     }
-    Object.assign(rec, { min: m.limit.min, max: m.limit.max, heading: m.limit.heading, limitName: m.limit.name, limitRaw: m.limit.raw });
+    Object.assign(rec, {
+      min: m.limit.min, max: m.limit.max, heading: m.limit.heading, limitName: m.limit.name,
+      limitCountry: m.limit.country || m.limit.heading || '', limitRaw: m.limit.raw, countryMatched: !!m.countryMatched,
+    });
     if (rec.amount == null) {
       rec.reason = UNCHECKED_REASONS.noamount + ` («${Core.normSpace(rec.amountRaw)}»)`;
-      run.unchecked.push(rec);
-      return;
+      return { rec, verdict: 'unchecked' };
     }
     const ev = Core.evaluate(rec.amount, m.limit);
     rec.diff = ev.diff;
-    if (ev.verdict === 'below') run.below.push(rec);
-    else if (ev.verdict === 'above') run.above.push(rec);
+    return { rec, verdict: ev.verdict };
+  }
+
+  function processRow(row, overrides) {
+    if (!isWantedStatus(row[run.keys.status])) return;
+    run.matched++;
+    const { rec, verdict } = checkRow(row, overrides);
+    if (verdict === 'below') run.below.push(rec);
+    else if (verdict === 'above') run.above.push(rec);
+    else if (verdict === 'unchecked') run.unchecked.push(rec);
   }
 
   async function startRun() {
@@ -864,7 +1025,8 @@
           run.keys = det.keys;
           run.source = det.source;
           log('Поля:', det);
-          const missing = ['ticketId', 'status', 'amount', 'subagent'].filter(f => !run.keys[f]);
+          const missing = ['ticketId', 'status', 'amount'].filter(f => !run.keys[f]);
+          if (!run.keys.method && !run.keys.subagent) missing.push('method/subagent');
           if (missing.length) {
             throw new Error('не удалось определить поля: ' + missing.join(', ') + '. Откройте «Диагностику» и пропишите ключи в CONFIG.fields');
           }
@@ -950,27 +1112,28 @@
     }
 
     const num = v => (v == null || v === '' ? '' : Number(v));
-    const vHeader = ['№', 'Ticket ID', 'Subagent', 'Amount by receipt', 'Валюта', 'Min', 'Max', 'Отклонение', 'Country', 'User ID', 'Status', 'Строка в Confluence', 'Раздел Confluence', 'Лимит (как в Confluence)'];
-    const vRow = (r, i) => [i + 1, r.ticketId, r.subagent, num(r.amount), r.currency, num(r.min), num(r.max), num(r.diff), r.country, r.userId, r.status, r.limitName, r.heading, r.limitRaw];
-    const uHeader = ['№', 'Ticket ID', 'Subagent', 'Amount by receipt', 'Валюта', 'Country', 'User ID', 'Status', 'Причина'];
-    const uRow = (r, i) => [i + 1, r.ticketId, r.subagent, r.amount == null ? Core.normSpace(r.amountRaw) : r.amount, r.currency, r.country, r.userId, r.status, r.reason];
+    const vHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Amount by receipt', 'Валюта', 'Min', 'Max', 'Отклонение', 'Country', 'User ID', 'Status', 'Метод в Confluence', 'Страна (Confluence)', 'Страна совпала', 'Лимит (как в Confluence)'];
+    const vRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, num(r.amount), r.currency, num(r.min), num(r.max), num(r.diff), r.country, r.userId, r.status, r.limitName, r.limitCountry, r.countryMatched ? 'да' : 'нет', r.limitRaw];
+    const uHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Amount by receipt', 'Валюта', 'Country', 'User ID', 'Status', 'Причина'];
+    const uRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, r.amount == null ? Core.normSpace(r.amountRaw) : r.amount, r.currency, r.country, r.userId, r.status, r.reason];
 
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, sheet(vHeader, run.below.map(vRow), '2F5597', [3, 5, 6, 7]), 'Ниже лимита');
-    XLSX.utils.book_append_sheet(wb, sheet(vHeader, run.above.map(vRow), 'C55A11', [3, 5, 6, 7]), 'Выше лимита');
-    XLSX.utils.book_append_sheet(wb, sheet(uHeader, run.unchecked.map(uRow), '7F7F7F', [3]), 'Не удалось проверить');
+    XLSX.utils.book_append_sheet(wb, sheet(vHeader, run.below.map(vRow), '2F5597', [4, 6, 7, 8]), 'Ниже лимита');
+    XLSX.utils.book_append_sheet(wb, sheet(vHeader, run.above.map(vRow), 'C55A11', [4, 6, 7, 8]), 'Выше лимита');
+    XLSX.utils.book_append_sheet(wb, sheet(uHeader, run.unchecked.map(uRow), '7F7F7F', [4]), 'Не удалось проверить');
 
-    // Сводка по субагентам
-    const bySub = {};
+    // Сводка по методам (method + страна)
+    const byMethod = {};
     const add = (r, key) => {
-      const s = bySub[r.subagent] || (bySub[r.subagent] = { below: 0, above: 0, min: r.min, max: r.max });
-      s[key]++;
+      const id = (r.method || r.subagent) + '\u0000' + r.country;
+      const g = byMethod[id] || (byMethod[id] = { method: r.method || r.subagent, country: r.country, below: 0, above: 0, min: r.min, max: r.max });
+      g[key]++;
     };
     run.below.forEach(r => add(r, 'below'));
     run.above.forEach(r => add(r, 'above'));
-    const sumRows = Object.keys(bySub)
-      .sort((a, b) => (bySub[b].below + bySub[b].above) - (bySub[a].below + bySub[a].above))
-      .map(s => [s, bySub[s].below, bySub[s].above, bySub[s].below + bySub[s].above, num(bySub[s].min), num(bySub[s].max)]);
+    const sumRows = Object.values(byMethod)
+      .sort((a, b) => (b.below + b.above) - (a.below + a.above))
+      .map(g => [g.method, g.country, g.below, g.above, g.below + g.above, num(g.min), num(g.max)]);
     const info = [
       ['Сформировано', fmtDateTime(new Date())],
       ['Период фильтра', `${listPayload && listPayload.dateFrom || ''} — ${listPayload && listPayload.dateTo || ''}`],
@@ -984,7 +1147,7 @@
       ['Обход завершён', run.complete ? 'да' : 'нет — ' + (run.error || 'остановлен вручную')],
       [],
     ];
-    const ws = sheet(['Subagent', 'Ниже', 'Выше', 'Всего', 'Min', 'Max'], sumRows, '375623', [4, 5]);
+    const ws = sheet(['Method', 'Country', 'Ниже', 'Выше', 'Всего', 'Min', 'Max'], sumRows, '375623', [5, 6]);
     XLSX.utils.sheet_add_aoa(ws, info, { origin: { r: sumRows.length + 2, c: 0 } });
     ws['!cols'][0] = { wch: Math.max(ws['!cols'][0].wch, 26) };
     XLSX.utils.book_append_sheet(wb, ws, 'Сводка');
@@ -1015,8 +1178,9 @@
     if (!rows && listUrl) {
       try { rows = await fetchListPage(1); } catch (e) { out.push('Не удалось загрузить стр. 1: ' + e.message); }
     }
+    let det = null;
     if (rows && rows.length) {
-      const det = detectFields(rows);
+      det = detectFields(rows);
       const src = { config: 'CONFIG.fields', screen: 'по таблице на экране', name: 'по названию ключа' };
       out.push('Определённые поля:');
       Object.keys(Core.FIELD_DEFS).forEach(f => {
@@ -1024,28 +1188,56 @@
         out.push(`  ${f.padEnd(9)} → ${k ? k : '— не найдено'}${k ? `   (${src[det.source[f]] || ''}; пример: ${JSON.stringify(rows[0][k])})` : ''}`);
       });
       out.push('');
-      out.push('Все ключи первой строки:');
-      Object.keys(rows[0]).forEach(k => out.push(`  ${k}: ${JSON.stringify(rows[0][k])}`.slice(0, 200)));
       log('Первая строка списка:', rows[0], 'поля:', det);
     } else if (listUrl) {
       out.push('Список пуст.');
+      out.push('');
     }
-    out.push('');
 
+    let li = null;
     try {
-      const li = await loadLimits(false);
+      li = await loadLimits(false);
       const parsed = li.entries.filter(e => e.min != null || e.max != null);
       out.push(`Confluence: таблиц ${li.tables.length}, строк ${li.entries.length}, лимит распознан в ${parsed.length}`);
       li.tables.slice(0, 5).forEach((t, i) => out.push(`  Таблица ${i + 1} «${t.heading}»: колонки ${JSON.stringify(t.headers)}`));
       out.push('Примеры распознанных строк:');
-      parsed.slice(0, 8).forEach(e => out.push(`  ${e.name} → min ${fmtNum(e.min)}, max ${fmtNum(e.max)}${e.striked ? ' (зачёркнута)' : ''}`));
+      parsed.slice(0, 8).forEach(e => out.push(`  ${e.name} [${e.country}] → min ${fmtNum(e.min)}, max ${fmtNum(e.max)}${e.striked ? ' (зачёркнута)' : ''}`));
       const bad = li.entries.filter(e => e.min == null && e.max == null);
       if (bad.length) {
-        out.push(`Нераспознанные строки (${bad.length}), первые 8:`);
-        bad.slice(0, 8).forEach(e => out.push(`  ${e.name} → ${e.raw.slice(0, 150)}`));
+        out.push(`Нераспознанные строки (${bad.length}), первые 10:`);
+        bad.slice(0, 10).forEach(e => out.push(`  ${e.name} [${e.country}] → ${e.raw.slice(0, 150)}`));
       }
     } catch (e) {
       out.push('Confluence: ошибка — ' + e.message);
+    }
+    out.push('');
+
+    // Проверка сопоставления на тикетах нужного статуса со стр. 1
+    if (det && li && det.keys.status) {
+      const prevKeys = run.keys;
+      run.keys = det.keys;
+      const overrides = Core.normOverrides(CONFIG.limitOverrides);
+      const sample = rows.filter(r => isWantedStatus(r[det.keys.status])).slice(0, 10);
+      out.push(`Проверка сопоставления — тикеты ${CONFIG.statuses.join(', ')} со стр. 1 (до 10 шт., найдено ${sample.length}):`);
+      if (!sample.length) out.push('  на странице нет тикетов в этом статусе');
+      const verdicts = { below: 'НИЖЕ лимита', above: 'ВЫШЕ лимита', ok: 'в лимите' };
+      sample.forEach(r => {
+        const { rec, verdict } = checkRow(r, overrides);
+        const head = `  #${rec.ticketId} | ${rec.method || '—'} | ${rec.country || '—'} | ${fmtNum(rec.amount)} ${rec.currency}`;
+        if (verdict === 'unchecked') {
+          out.push(`${head}\n      → не проверен: ${rec.reason}`);
+        } else {
+          out.push(`${head}\n      → «${rec.limitName}» [${rec.limitCountry}${rec.countryMatched ? '' : ', страна НЕ совпала'}] `
+            + `min ${fmtNum(rec.min)} – max ${fmtNum(rec.max)} (по ${rec.matchedBy}) → ${verdicts[verdict]}`);
+        }
+      });
+      run.keys = prevKeys;
+      out.push('');
+    }
+
+    if (rows && rows.length) {
+      out.push('Все ключи первой строки:');
+      Object.keys(rows[0]).forEach(k => out.push(`  ${k}: ${JSON.stringify(rows[0][k])}`.slice(0, 200)));
     }
     ui.diagText = out.join('\n');
     setStatus('Диагностика готова');
@@ -1099,6 +1291,7 @@
     #lmf-body td.neg{color:#7cb4ff;} #lmf-body td.pos{color:#ffb070;}
     #lmf-body .tid{color:#cbbcff;font-weight:700;cursor:pointer;text-decoration:underline dotted;}
     #lmf-body .muted{color:#8a84b0;font-size:11px;}
+    #lmf-body .warn{color:#f0a500;}
     #lmf-body .empty{padding:30px;text-align:center;color:#8a84b0;}
     #lmf-body pre{white-space:pre-wrap;font:12px/1.5 Consolas,monospace;color:#d8d2ff;margin:12px 0;}
     #lmf-foot{padding:8px 18px;border-top:1px solid rgba(255,255,255,.06);font-size:11px;color:#a8a1d6;min-height:16px;}
@@ -1153,15 +1346,15 @@
       <tr>
         <td class="muted">${i + 1}</td>
         <td><span class="tid" data-tid="${esc(r.ticketId)}" title="Скопировать">${esc(r.ticketId)}</span></td>
-        <td>${esc(r.subagent)}${r.limitName && Core.normName(r.limitName) !== Core.normName(r.subagent) ? `<div class="muted">в Confluence: ${esc(r.limitName)}</div>` : ''}</td>
+        <td>${esc(r.method || r.subagent)}${r.method && r.subagent ? `<div class="muted">${esc(r.subagent)}</div>` : ''}</td>
         <td class="num">${fmtNum(r.amount)} ${esc(r.currency)}</td>
         <td class="num">${fmtNum(r.min)}</td>
         <td class="num">${fmtNum(r.max)}</td>
         <td class="num ${kind === 'below' ? 'neg' : 'pos'}">${r.diff > 0 ? '+' : ''}${fmtNum(r.diff)}</td>
         <td>${esc(r.country)}</td>
-        <td class="muted">${esc(r.heading)}</td>
+        <td>${esc(r.limitName)}<div class="muted">${esc(r.limitCountry)}${r.countryMatched ? '' : ' <span class="warn">⚠ страна не совпала</span>'}</div></td>
       </tr>`).join('');
-    return `<table><thead><tr><th>№</th><th>Ticket ID</th><th>Subagent</th><th>Amount by receipt</th><th>Min</th><th>Max</th><th>Отклонение</th><th>Country</th><th>Раздел Confluence</th></tr></thead><tbody>${rows}</tbody></table>`;
+    return `<table><thead><tr><th>№</th><th>Ticket ID</th><th>Method / Subagent</th><th>Amount by receipt</th><th>Min</th><th>Max</th><th>Отклонение</th><th>Country</th><th>Строка Confluence</th></tr></thead><tbody>${rows}</tbody></table>`;
   }
 
   function uTable(list) {
@@ -1170,12 +1363,12 @@
       <tr>
         <td class="muted">${i + 1}</td>
         <td><span class="tid" data-tid="${esc(r.ticketId)}" title="Скопировать">${esc(r.ticketId)}</span></td>
-        <td>${esc(r.subagent)}</td>
+        <td>${esc(r.method || r.subagent)}${r.method && r.subagent ? `<div class="muted">${esc(r.subagent)}</div>` : ''}</td>
         <td class="num">${r.amount == null ? esc(Core.normSpace(r.amountRaw)) : fmtNum(r.amount)} ${esc(r.currency)}</td>
         <td>${esc(r.country)}</td>
         <td>${esc(r.reason)}</td>
       </tr>`).join('');
-    return `<table><thead><tr><th>№</th><th>Ticket ID</th><th>Subagent</th><th>Amount by receipt</th><th>Country</th><th>Причина</th></tr></thead><tbody>${rows}</tbody></table>`;
+    return `<table><thead><tr><th>№</th><th>Ticket ID</th><th>Method / Subagent</th><th>Amount by receipt</th><th>Country</th><th>Причина</th></tr></thead><tbody>${rows}</tbody></table>`;
   }
 
   let renderPending = false;
