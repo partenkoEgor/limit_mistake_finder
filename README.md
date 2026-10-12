@@ -5,9 +5,12 @@ Tampermonkey-скрипт **TH Management — Limit Mistake Finder** (`limit-mis
 Проходит **все страницы** текущего фильтра на `paymentsupport` и `ExtendedPaymentRequestList`, берёт тикеты в статусах **Credited (M)** и **Credited (Fraud) (M)** и сравнивает **Amount by receipt** (поле `amount`) с лимитами их **метода** со страницы Confluence «ЛИМИТЫ РУЧНЫЕ» с учётом страны. Тикеты ниже или выше лимита показываются списком, и их можно скачать в Excel.
 
 ## Установка
-1. Tampermonkey → «Создать новый скрипт» → вставить содержимое `limit-mistake-finder.user.js` → сохранить.
-2. Залогиниться в Confluence (`doc.office.lan`) в этом же браузере: скрипт загружает страницу лимитов с вашими куками.
-3. При первом запросе к `doc.office.lan` Tampermonkey спросит разрешение — нажать «Always allow domain».
+1. Установить расширение Tampermonkey.
+2. Открыть ссылку **https://raw.githubusercontent.com/partenkoEgor/limit_mistake_finder/main/limit-mistake-finder.user.js** — Tampermonkey сам предложит установить скрипт, нажать «Установить».
+3. Залогиниться в Confluence (`doc.office.lan`) в этом же браузере: скрипт загружает страницу лимитов с вашими куками.
+4. При первом запросе к `doc.office.lan` Tampermonkey спросит разрешение — нажать «Always allow domain».
+
+Обновления приходят автоматически (Tampermonkey проверяет `@updateURL`), вручную — «Проверить обновления» в меню Tampermonkey.
 
 ## Как пользоваться
 1. Открыть List of payment queries (или Extended) и задать фильтр. Чтобы проверка шла быстрее, можно сразу отфильтровать по статусу Credited (M).

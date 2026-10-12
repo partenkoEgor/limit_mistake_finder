@@ -2,7 +2,7 @@
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
 // @version      1.13
-// @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
+// @description  Проходит все страницы текущего фильтра, берёт тикеты в статусах Credited (M) и Credited (Fraud) (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://managment.io/*/admin/backoffice/paymentsupport*
@@ -15,6 +15,8 @@
 // @grant        unsafeWindow
 // @connect      doc.office.lan
 // @run-at       document-start
+// @updateURL    https://raw.githubusercontent.com/partenkoEgor/limit_mistake_finder/main/limit-mistake-finder.user.js
+// @downloadURL  https://raw.githubusercontent.com/partenkoEgor/limit_mistake_finder/main/limit-mistake-finder.user.js
 // ==/UserScript==
 
 (function () {
