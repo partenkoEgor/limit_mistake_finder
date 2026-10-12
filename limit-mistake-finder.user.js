@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.11
+// @version      1.12
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.11';
+  const VERSION = '1.12';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -771,9 +771,13 @@
       // валюта тикета: «Sham Cash» + USD → строка «Sham Cash USD», а не SYP.
       // Применяется, только если отсекает часть строк и что-то оставляет
       let cands = best.cands;
-      if (codes.length && cands.length > 1) {
-        const byCur = cands.filter(e => codes.some(c => hasWords(e.norm, c) || hasWords(e.rawNorm, c)));
-        if (byCur.length && byCur.length < cands.length) cands = byCur;
+      // Сначала валюта платежа (currencyKode), потом все коды (валюта
+      // счёта currencyUserKode может отличаться: платёж SYP, счёт USD)
+      const primaryCode = normSpace(ticket.currency).toLowerCase();
+      for (const set of [primaryCode ? [primaryCode] : [], codes]) {
+        if (!set.length || cands.length < 2) continue;
+        const byCur = cands.filter(e => set.some(c => hasWords(e.norm, c) || hasWords(e.rawNorm, c)));
+        if (byCur.length && byCur.length < cands.length) { cands = byCur; break; }
       }
       const via = best.via;
       const countryMatched = best.countryMatched;
