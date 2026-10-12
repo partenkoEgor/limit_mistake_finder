@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.3
+// @version      1.4
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.3';
+  const VERSION = '1.4';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -421,9 +421,11 @@
           const parts = rawParts.map(normName).filter(Boolean);
           // названия без бренда: «ATTIJARI (1XCasino)» → «attijari»,
           // «Orange Cash (1XCasino) Axinite…» → «orange cash»
-          const aliases = [norm].concat(parts,
+          let aliases = [norm].concat(parts,
             rawParts.map(x => normName(x.replace(/\([^)]*\)/g, ' '))),
-            rawParts.map(x => normName(x.split('(')[0])))
+            rawParts.map(x => normName(x.split('(')[0])));
+          // и без общего слова «Bank»: «CDM Bank» → «cdm»
+          aliases = aliases.concat(aliases.map(dropGeneric))
             .filter((a, i, arr) => a && arr.indexOf(a) === i);
           const lim = parseLimitRow(tbl.headers, row.cells);
           const countryCell = countryCol > 0 ? normSpace(row.cells[countryCol]) : '';
@@ -475,19 +477,33 @@
     // Строки Confluence для одного варианта названия — уровни по
     // убыванию точности: точное → без пробелов/апострофов → название из
     // Confluence входит в запрос (самые длинные) → запрос входит в название
-    function candidateTiers(entries, n) {
+    // Общие слова, без которых название метода остаётся узнаваемым
+    const GENERIC_WORDS = ['bank', 'банк'];
+    function dropGeneric(n) {
+      return n.split(' ').filter(w => GENERIC_WORDS.indexOf(w) === -1).join(' ');
+    }
+
+    // Слова, которые не могут быть названием метода: страны и валюты
+    const COUNTRY_WORDS = {};
+    Object.keys(COUNTRY_ALIASES).forEach(k => COUNTRY_ALIASES[k].forEach(a => { COUNTRY_WORDS[normName(a)] = 1; }));
+    function isStopName(x, codes) {
+      return !!COUNTRY_WORDS[x] || (codes || []).indexOf(x) !== -1;
+    }
+
+    // codes — коды валют тикета (в нижнем регистре)
+    function candidateTiers(entries, n, codes) {
       const tiers = [];
       tiers.push(entries.filter(e => e.aliases.indexOf(n) !== -1));
       const nc = n.replace(/ /g, '');
       tiers.push(entries.filter(e => e.compacts.indexOf(nc) !== -1)); // «L'bankalik» = «Lbankalik»
-      if (n.length >= 4) {
+      if (n.length >= 3 && !isStopName(n, codes)) {
         // по уровню на каждую длину названия, от самых длинных: если
         // «Al Barid Bank (BizBet)» чужого проекта, следующим уровнем
         // проверяется «Al Barid»
         const inner = [];
         entries.forEach(e => {
           const len = e.aliases
-            .filter(x => x.length >= 4 && hasWords(n, x))
+            .filter(x => x.length >= 3 && !isStopName(x, codes) && hasWords(n, x))
             .reduce((m, x) => Math.max(m, x.length), 0);
           if (len) inner.push({ e, len });
         });
@@ -504,6 +520,11 @@
       return candidateTiers(entries, n)[0] || [];
     }
 
+    function ticketCodes(ticket) {
+      return [ticket.currency].concat(ticket.currencies || [])
+        .map(c => normSpace(c).toLowerCase()).filter(Boolean);
+    }
+
     // Варианты названия для поиска: method, method без кода валюты, subagent
     function buildQueries(ticket) {
       const out = [];
@@ -511,14 +532,14 @@
         const n = normName(text);
         if (n && !out.some(q => q.n === n)) out.push({ n, via, text: normSpace(text) });
       };
-      const codes = [ticket.currency].concat(ticket.currencies || [])
-        .map(c => normSpace(c).toLowerCase()).filter(Boolean);
+      const codes = ticketCodes(ticket);
       add(ticket.method, 'method');
       if (normSpace(ticket.method)) {
         const stripped = normSpace(ticket.method).split(' ')
           .filter(w => !/^[A-Z]{3}$/.test(w) && codes.indexOf(w.toLowerCase()) === -1)
           .join(' ');
         add(stripped, 'method');
+        add(dropGeneric(normName(stripped)), 'method'); // «Optima Bank» → «optima»
       }
       add(ticket.subagent, 'subagent');
       return out;
@@ -562,13 +583,14 @@
       // совпали и страна (2 балла), и проект (1 балл); при равенстве —
       // самый точный (первый) вариант
       const hasRef = !!(normName(ticket.ref) || normSpace(ticket.refId));
+      const codes = ticketCodes(ticket);
       const tk = countryKeys(ticket.country);
       const tn = normName(ticket.country);
       const maxScore = (tn ? 2 : 0) + (hasRef ? 1 : 0);
       let best = null;
       outer:
       for (const q of queries) {
-        for (const tier of candidateTiers(entries, q.n)) {
+        for (const tier of candidateTiers(entries, q.n, codes)) {
           let list = tier;
           let countryMatched = false;
           if (tn) {
