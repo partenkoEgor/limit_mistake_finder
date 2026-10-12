@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.12
+// @version      1.13
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.12';
+  const VERSION = '1.13';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -659,6 +659,12 @@
       return (patterns || DEFAULT_WEBDEFAULT_REFS).some(p => (p instanceof RegExp ? p.test(ref) : normName(p).replace(/ /g, '') === ref));
     }
 
+    // Строка относится к проекту тикета (по названию проекта или refId)
+    function isProjectRow(e, ref, refId) {
+      return !!((ref && (e.brandTags.indexOf(ref) !== -1 || e.compact.indexOf(ref) !== -1))
+        || (refId && (e.switchTokens.indexOf(refId) !== -1 || (e.refIds || []).indexOf(refId) !== -1)));
+    }
+
     function brandFilter(cands, ticket) {
       const ref = normName(ticket.ref).replace(/ /g, '');
       const refId = normSpace(ticket.refId);
@@ -675,13 +681,18 @@
         const list = webDefaultRows();
         return list.length ? { list, matched: true } : { list: cands, matched: false };
       }
-      const list = cands.filter(e => (ref && (e.brandTags.indexOf(ref) !== -1 || e.compact.indexOf(ref) !== -1))
-        || (refId && (e.switchTokens.indexOf(refId) !== -1 || (e.refIds || []).indexOf(refId) !== -1)));
+      const list = cands.filter(e => isProjectRow(e, ref, refId));
       if (list.length) return { list, matched: true };
-      // у проекта нет своей строки — берём webDefault (проект не совпал →
-      // при сумме в лимите тикет уйдёт в «Проверить вручную»)
+      // своей строки нет — берём webDefault. Если у проекта вообще нет
+      // таблицы для этой страны, лимиты webDefault и есть его лимиты (так
+      // работает, например, 1xCasino в Бахрейне). Если таблица есть, а
+      // метода в ней нет — «проект не совпал», на ручную проверку
       const fallback = webDefaultRows();
-      return { list: fallback.length ? fallback : cands, matched: false };
+      return {
+        list: fallback.length ? fallback : cands,
+        matched: !!(ticket._noOwnTable && fallback.length),
+        viaDefault: !!(ticket._noOwnTable && fallback.length),
+      };
     }
 
     // Строки, название которых целиком есть в Subagent (самые длинные):
@@ -703,7 +714,7 @@
       if (!list.length) return null;
       const bf = brandFilter(list, ticket);
       if (!bf.list.some(hasLimit)) return null;
-      return { cands: bf.list, countryMatched: true, brandMatched: bf.matched };
+      return { cands: bf.list, countryMatched: true, brandMatched: bf.matched, viaDefault: !!bf.viaDefault };
     }
 
     // ticket: { method, subagent, country, currency, ref, refId } (или строка)
@@ -729,6 +740,13 @@
       const codes = ticketCodes(ticket);
       const tk = countryKeys(ticket.country);
       const tn = normName(ticket.country);
+      const inCountry = e => (tk.length ? tk.some(k => e.countryKeys.indexOf(k) !== -1) : hasWords(e.countryText, tn));
+      // есть ли у проекта тикета своя таблица (строки) для его страны
+      const refN = normName(ticket.ref).replace(/ /g, '');
+      const refIdN = normSpace(ticket.refId);
+      if ((refN || refIdN) && tn && !isWebDefaultRef(refN, refIdN, ticket.webDefaultRefs)) {
+        ticket = Object.assign({}, ticket, { _noOwnTable: !entries.some(e => isProjectRow(e, refN, refIdN) && inCountry(e)) });
+      }
       const maxScore = (tn ? 2 : 0) + (hasRef ? 1 : 0);
       // Внутри одного варианта названия строка с распознанным лимитом
       // важнее строки «лимиты в строчке ниже»; между вариантами решает
@@ -749,7 +767,7 @@
           const score = (countryMatched ? 2 : 0) + (bf.matched ? 1 : 0);
           const parsedAny = bf.list.some(hasLimit);
           if (!qBest || score > qBest.score || (score === qBest.score && parsedAny && !qBest.parsedAny)) {
-            qBest = { cands: bf.list, via: q.via, countryMatched, brandMatched: bf.matched, score, parsedAny };
+            qBest = { cands: bf.list, via: q.via, countryMatched, brandMatched: bf.matched, score, parsedAny, viaDefault: !!bf.viaDefault };
           }
           if (score >= maxScore && parsedAny) break;
         }
@@ -760,7 +778,9 @@
 
       // Subagent прямо называет метод («Arcturus CLIQ Jordan» → «Cliq»), а
       // method указывает на другую строку («Bank al Etihad») — важнее Subagent
-      let info = '';
+      let info = best.viaDefault
+        ? `у проекта ${normSpace(ticket.ref) || normSpace(ticket.refId)} нет своей таблицы для страны — лимиты webDefault`
+        : '';
       const subRows = subagentNamedRows(entries, ticket, codes, tk, tn);
       if (subRows && normSpace(ticket.method) && best.via === 'method'
           && !subRows.cands.some(e => best.cands.indexOf(e) !== -1)
