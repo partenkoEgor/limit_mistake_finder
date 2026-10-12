@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.7
+// @version      1.8
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.7';
+  const VERSION = '1.8';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -1238,6 +1238,7 @@
     below: [],
     above: [],
     unchecked: [],
+    manual: [], // в лимите, но строка Confluence взята другой страны/проекта
     startedAt: null,
     finishedAt: null,
     complete: false,
@@ -1321,6 +1322,14 @@
     if (verdict === 'below') run.below.push(rec);
     else if (verdict === 'above') run.above.push(rec);
     else if (verdict === 'unchecked') run.unchecked.push(rec);
+    else if (verdict === 'ok') {
+      // в лимите, но лимит взят из строки другой страны или проекта —
+      // результат ненадёжен, человеку стоит посмотреть самому
+      const why = [];
+      if (!rec.countryMatched) why.push(`страна не совпала (тикет: ${rec.country || '—'}, Confluence: ${rec.limitCountry || '—'})`);
+      if ((rec.ref || rec.refId) && !rec.brandMatched) why.push(`проект не совпал (тикет: ${rec.ref || rec.refId})`);
+      if (why.length) { rec.reason = why.join('; '); run.manual.push(rec); }
+    }
   }
 
   async function startRun() {
@@ -1331,7 +1340,7 @@
     }
     Object.assign(run, {
       running: true, stopRequested: false, page: 0, seen: 0, matched: 0,
-      below: [], above: [], unchecked: [], startedAt: new Date(), finishedAt: null, complete: false, error: '',
+      below: [], above: [], unchecked: [], manual: [], startedAt: new Date(), finishedAt: null, complete: false, error: '',
       keys: null, source: null,
     });
     setBusy(true);
@@ -1412,7 +1421,7 @@
   // ------------------------------------------------------------------
   function downloadExcel() {
     if (typeof XLSX === 'undefined') { showToast('Библиотека XLSX не загрузилась (@require)', 'err'); return; }
-    const total = run.below.length + run.above.length + run.unchecked.length;
+    const total = run.below.length + run.above.length + run.unchecked.length + run.manual.length;
     if (!total) { showToast('Нет данных для выгрузки', 'err'); return; }
 
     const border = { style: 'thin', color: { rgb: 'BFBFBF' } };
@@ -1456,6 +1465,9 @@
     XLSX.utils.book_append_sheet(wb, sheet(vHeader, run.below.map(vRow), '2F5597', [5, 7, 8, 9]), 'Ниже лимита');
     XLSX.utils.book_append_sheet(wb, sheet(vHeader, run.above.map(vRow), 'C55A11', [5, 7, 8, 9]), 'Выше лимита');
     XLSX.utils.book_append_sheet(wb, sheet(uHeader, run.unchecked.map(uRow), '7F7F7F', [5]), 'Не удалось проверить');
+    const mHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Ref', 'Amount by receipt', 'Валюта', 'Min', 'Max', 'Country', 'User ID', 'Status', 'Метод в Confluence', 'Страна (Confluence)', 'Почему проверить', 'Лимит (как в Confluence)'];
+    const mRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, r.ref, num(r.amount), r.currency, num(r.min), num(r.max), r.country, r.userId, r.status, r.limitName, r.limitCountry, r.reason, r.limitRaw];
+    XLSX.utils.book_append_sheet(wb, sheet(mHeader, run.manual.map(mRow), 'BF8F00', [5, 7, 8]), 'Проверить вручную');
 
     // Сводка по методам (method + страна)
     const byMethod = {};
@@ -1479,6 +1491,7 @@
       ['Ниже лимита', run.below.length],
       ['Выше лимита', run.above.length],
       ['Не удалось проверить', run.unchecked.length],
+      ['Проверить вручную (в лимите, но строка другой страны/проекта)', run.manual.length],
       ['Обход завершён', run.complete ? 'да' : 'нет — ' + (run.error || 'остановлен вручную')],
       [],
     ];
@@ -1701,7 +1714,7 @@
         <td class="num">${fmtNum(r.amount)} ${esc(r.currency)}</td>
         <td class="num">${fmtNum(r.min)}</td>
         <td class="num">${fmtNum(r.max)}</td>
-        <td class="num ${kind === 'below' ? 'neg' : 'pos'}">${r.diff > 0 ? '+' : ''}${fmtNum(r.diff)}</td>
+        <td class="num ${kind === 'below' ? 'neg' : kind === 'above' ? 'pos' : ''}">${kind === 'manual' ? 'в лимите' : (r.diff > 0 ? '+' : '') + fmtNum(r.diff)}</td>
         <td>${esc(r.country)}</td>
         <td>${esc(r.limitName)}<div class="muted">${esc(r.limitCountry)}${r.countryMatched ? '' : ' <span class="warn">⚠ страна не совпала</span>'}${(r.ref || r.refId) && !r.brandMatched ? ' <span class="warn">⚠ проект не совпал</span>' : ''}</div></td>
       </tr>`).join('');
@@ -1738,17 +1751,19 @@
       $('t-below').textContent = `Ниже лимита (${run.below.length})`;
       $('t-above').textContent = `Выше лимита (${run.above.length})`;
       $('t-unk').textContent = `Не удалось проверить (${run.unchecked.length})`;
+      $('t-man').textContent = `Проверить вручную (${run.manual.length})`;
       document.querySelectorAll('.lmf-tab').forEach(b => b.classList.toggle('on', b.dataset.tab === ui.tab));
       const total = run.below.length + run.above.length;
       const cnt = $('lmf-fab').querySelector('.cnt');
       cnt.textContent = total;
       cnt.style.display = total ? '' : 'none';
-      $('lmf-xlsx').disabled = !(total + run.unchecked.length);
+      $('lmf-xlsx').disabled = !(total + run.unchecked.length + run.manual.length);
 
       const body = $('lmf-body');
       if (ui.tab === 'below') body.innerHTML = vTable(run.below, 'below');
       else if (ui.tab === 'above') body.innerHTML = vTable(run.above, 'above');
       else if (ui.tab === 'unk') body.innerHTML = uTable(run.unchecked);
+      else if (ui.tab === 'man') body.innerHTML = vTable(run.manual, 'manual');
       else body.innerHTML = `<pre>${esc(ui.diagText || 'Нажмите «Диагностика»')}</pre>`;
     });
   }
@@ -1791,6 +1806,7 @@
           <button class="lmf-tab on" data-tab="below" id="t-below">Ниже лимита</button>
           <button class="lmf-tab" data-tab="above" id="t-above">Выше лимита</button>
           <button class="lmf-tab" data-tab="unk" id="t-unk">Не удалось проверить</button>
+          <button class="lmf-tab" data-tab="man" id="t-man" title="В лимите, но лимит взят из строки другой страны или проекта">Проверить вручную</button>
           <button class="lmf-tab" data-tab="diag">Диагностика</button>
         </div>
         <div id="lmf-body"></div>
