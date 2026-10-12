@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.4
+// @version      1.5
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.4';
+  const VERSION = '1.5';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -542,6 +542,16 @@
         add(dropGeneric(normName(stripped)), 'method'); // «Optima Bank» → «optima»
       }
       add(ticket.subagent, 'subagent');
+      // части Subagent («Orange Baojun» → «orange», «baojun»): подряд идущие
+      // слова, от длинных к коротким; страны, валюты и «bank» пропускаем
+      const words = normName(ticket.subagent).split(' ').filter(Boolean);
+      for (let len = words.length - 1; len >= 1; len--) {
+        for (let i = 0; i + len <= words.length; i++) {
+          const part = words.slice(i, i + len).join(' ');
+          if (part.length < 3 || isStopName(part, codes) || GENERIC_WORDS.indexOf(part) !== -1) continue;
+          add(part, 'subagent');
+        }
+      }
       return out;
     }
 
