@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.1
+// @version      1.2
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусе Credited (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -26,7 +26,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.1';
+  const VERSION = '1.2';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -52,6 +52,8 @@
       amount: 'amount',
       method: null,
       subagent: null,
+      ref: null,
+      refId: null,
       country: null,
       userId: null,
       currency: null,
@@ -75,6 +77,12 @@
     limitOverrides: {
     },
 
+    // Бренды/проекты в Confluence (в скобках после метода или в
+    // «Переключалке»). Дополняется автоматически тем, что встречается в
+    // скобках 2+ раз. По nameRef тикета выбирается строка своего проекта.
+    knownBrands: ['1xcasino', 'afropari', 'bizbet', 'rolsbet', 'melbet', 'betwinner', 'megapari', 'paripesa',
+      '22bet', 'linebet', 'helabet', '888starz', 'betandyou', '1xbit', 'dbbet', 'xparibet', 'betpari'],
+
     // Пауза между страницами списка (мс)
     pageDelay: 400,
     // Сколько раз повторять страницу при ошибке сети / 5xx
@@ -93,7 +101,8 @@
   const Core = (function () {
     function normSpace(s) {
       return String(s == null ? '' : s)
-        .replace(/[    ]/g, ' ')
+        .replace(/[\u200b-\u200f\u2060\ufeff\u00ad]/g, '') // невидимые символы из Confluence
+        .replace(/[\u00a0\u202f\u2007\u2009]/g, ' ')
         .replace(/\s+/g, ' ')
         .trim();
     }
@@ -102,10 +111,11 @@
       return normSpace(s).toLowerCase().replace(/^\d+\s*[-–—:]\s*/, '').replace(/\s+/g, '');
     }
 
+    // всё, кроме букв и цифр, — в пробел: «L'bankalik» → «l bankalik»
     function normName(s) {
       return normSpace(s).toLowerCase()
         .replace(/ё/g, 'е')
-        .replace(/[\s_\-–—.,;:/\\|()[\]"'«»]+/g, ' ')
+        .replace(/[^\p{L}\p{N}]+/gu, ' ')
         .trim();
     }
 
@@ -167,8 +177,23 @@
     const RANGE_RE = new RegExp('(' + NUM + ')\\s*(?:[a-zа-яё$€£]{1,4}\\.?\\s*)?(?:-|–|—|~|\\.{2,3}|…|to|до)\\s*(' + NUM + ')', 'i');
 
     // Текст ячейки лимита → { min, max } (null — граница не найдена)
+    // Из ячейки «DEPOSIT LIMITS min 15 - max 20000 WITHDRAWAL min 50 - …»
+    // оставляем раздел депозита
+    function depositSection(t) {
+      const wd = t.search(/withdraw|вывод|payout/i);
+      if (wd < 0) return t;
+      const dep = t.search(/deposit|депозит|пополн/i);
+      if (dep > wd) {
+        // вывод идёт первым: берём от депозита до следующего упоминания вывода
+        const rest = t.slice(dep);
+        const wd2 = rest.search(/withdraw|вывод|payout/i);
+        return wd2 > 0 ? rest.slice(0, wd2) : rest;
+      }
+      return t.slice(0, wd);
+    }
+
     function parseLimitText(text) {
-      const t = normSpace(text);
+      const t = depositSection(normSpace(text));
       if (!t) return { min: null, max: null };
       const mn = t.match(MIN_RE);
       const mx = t.match(MAX_RE);
@@ -264,6 +289,63 @@
       pakistan: ['pakistan', 'пакистан'],
       bangladesh: ['bangladesh', 'бангладеш'],
       india: ['india', 'индия'],
+      // СНГ
+      kyrgyzstan: ['kyrgyzstan', 'kyrgyz republic', 'kirgizia', 'кыргызстан', 'киргизия', 'киргизстан'],
+      kazakhstan: ['kazakhstan', 'казахстан'],
+      uzbekistan: ['uzbekistan', 'узбекистан'],
+      tajikistan: ['tajikistan', 'таджикистан'],
+      turkmenistan: ['turkmenistan', 'туркменистан'],
+      azerbaijan: ['azerbaijan', 'азербайджан'],
+      armenia: ['armenia', 'армения'],
+      georgia: ['georgia', 'грузия'],
+      russia: ['russia', 'russian federation', 'россия', 'рф'],
+      ukraine: ['ukraine', 'украина'],
+      belarus: ['belarus', 'беларусь', 'белоруссия'],
+      moldova: ['moldova', 'молдова', 'молдавия'],
+      mongolia: ['mongolia', 'монголия'],
+      // Африка
+      nigeria: ['nigeria', 'нигерия'],
+      kenya: ['kenya', 'кения'],
+      ethiopia: ['ethiopia', 'эфиопия'],
+      ghana: ['ghana', 'гана'],
+      tanzania: ['tanzania', 'танзания'],
+      uganda: ['uganda', 'уганда'],
+      cameroon: ['cameroon', 'камерун'],
+      senegal: ['senegal', 'сенегал'],
+      ivorycoast: ['cote d ivoire', 'côte d ivoire', 'ivory coast', 'кот д ивуар'],
+      zambia: ['zambia', 'замбия'],
+      rwanda: ['rwanda', 'руанда'],
+      southafrica: ['south africa', 'юар', 'южная африка'],
+      chad: ['chad', 'чад'],
+      niger: ['niger', 'нигер'],
+      mali: ['mali', 'мали'],
+      burkina: ['burkina faso', 'буркина фасо'],
+      guinea: ['guinea', 'гвинея'],
+      benin: ['benin', 'бенин'],
+      togo: ['togo', 'того'],
+      congo: ['congo', 'конго'],
+      // Азия
+      indonesia: ['indonesia', 'индонезия'],
+      malaysia: ['malaysia', 'малайзия'],
+      philippines: ['philippines', 'филиппины'],
+      vietnam: ['vietnam', 'viet nam', 'вьетнам'],
+      thailand: ['thailand', 'таиланд', 'тайланд'],
+      myanmar: ['myanmar', 'мьянма'],
+      cambodia: ['cambodia', 'камбоджа'],
+      nepal: ['nepal', 'непал'],
+      srilanka: ['sri lanka', 'шри ланка'],
+      // Латинская Америка
+      brazil: ['brazil', 'бразилия'],
+      argentina: ['argentina', 'аргентина'],
+      chile: ['chile', 'чили'],
+      peru: ['peru', 'перу'],
+      colombia: ['colombia', 'колумбия'],
+      mexico: ['mexico', 'мексика'],
+      ecuador: ['ecuador', 'эквадор'],
+      bolivia: ['bolivia', 'боливия'],
+      venezuela: ['venezuela', 'венесуэла'],
+      // Европа
+      cyprus: ['cyprus', 'кипр'],
     };
 
     function hasWords(text, words) {
@@ -271,31 +353,66 @@
     }
 
     // Текст → набор канонических стран, которые в нём упомянуты
+    const COUNTRY_NORM = Object.keys(COUNTRY_ALIASES).map(k => [k, COUNTRY_ALIASES[k].map(a => normName(a))]);
     function countryKeys(text) {
       const n = normName(text);
       if (!n) return [];
-      return Object.keys(COUNTRY_ALIASES).filter(k => COUNTRY_ALIASES[k].some(a => hasWords(n, normName(a))));
+      return COUNTRY_NORM.filter(([, aliases]) => aliases.some(a => hasWords(n, a))).map(([k]) => k);
     }
 
     // tables: [{ heading, headers:[], rows:[{ cells:[text], striked }] }]
-    function buildLimitIndex(tables) {
+    const COL_SWITCH_RE = /переключ|switch/;
+
+    function parenTexts(name) {
+      return (String(name).match(/\(([^)]*)\)/g) || []).map(x => normName(x)).filter(Boolean);
+    }
+
+    // knownBrands — бренды из CONFIG; к ним добавляется всё, что в скобках
+    // названий встречается 2+ раз («(1XCasino)», «(BizBet)»…)
+    function buildLimitIndex(tables, knownBrands) {
+      const parenCount = {};
+      tables.forEach(tbl => tbl.rows.forEach(row => {
+        parenTexts(row.cells[0]).forEach(p => { parenCount[p] = (parenCount[p] || 0) + 1; });
+      }));
+      const brandSet = {};
+      (knownBrands || []).forEach(b => { const n = normName(b); if (n) brandSet[n] = 1; });
+      Object.keys(parenCount).forEach(p => { if (parenCount[p] >= 2) brandSet[p] = 1; });
+      delete brandSet.webdefault;
+
       const entries = [];
       tables.forEach(tbl => {
         const countryCol = tbl.headers.findIndex((x, i) => i > 0 && COL_COUNTRY_RE.test(normName(x)));
+        const switchCol = tbl.headers.findIndex((x, i) => i > 0 && COL_SWITCH_RE.test(normName(x)));
         tbl.rows.forEach(row => {
           const name = normSpace(row.cells[0]);
           if (!name) return;
           const norm = normName(name);
           if (!norm) return;
           if (HEADER_FIRST_CELL_RE.test(norm)) return; // повтор строки заголовков
-          const parts = String(row.cells[0]).split(/[\n,;/|]+/).map(normName).filter(Boolean);
+          const rawParts = String(row.cells[0]).split(/[\n,;/|]+/).filter(x => normSpace(x));
+          const parts = rawParts.map(normName).filter(Boolean);
+          // названия без бренда: «ATTIJARI (1XCasino)» → «attijari»,
+          // «Orange Cash (1XCasino) Axinite…» → «orange cash»
+          const aliases = [norm].concat(parts,
+            rawParts.map(x => normName(x.replace(/\([^)]*\)/g, ' '))),
+            rawParts.map(x => normName(x.split('(')[0])))
+            .filter((a, i, arr) => a && arr.indexOf(a) === i);
           const lim = parseLimitRow(tbl.headers, row.cells);
           const countryCell = countryCol > 0 ? normSpace(row.cells[countryCol]) : '';
           const heading = tbl.heading || '';
+          const switchTokens = switchCol > 0 ? normName(row.cells[switchCol]).split(' ').filter(Boolean) : [];
+          // бренд строки: скобки и слова названия + слова «Переключалки»
+          const tagSource = parenTexts(name).concat(norm.split(' '), switchTokens);
+          const brandTags = tagSource.filter((t, i) => brandSet[t] && tagSource.indexOf(t) === i);
           entries.push({
             name,
             norm,
+            compact: norm.replace(/ /g, ''),
             parts,
+            aliases,
+            compacts: aliases.map(a => a.replace(/ /g, '')),
+            brandTags,
+            switchTokens,
             min: lim.min,
             max: lim.max,
             heading,
@@ -307,6 +424,7 @@
           });
         });
       });
+      entries.brands = Object.keys(brandSet);
       return entries;
     }
 
@@ -326,27 +444,33 @@
 
     // Строки Confluence для одного варианта названия: точное → часть
     // ячейки → вхождение целыми словами (самые длинные названия)
+    // Строки Confluence для одного варианта названия — уровни по
+    // убыванию точности: точное → без пробелов/апострофов → название из
+    // Confluence входит в запрос (самые длинные) → запрос входит в название
+    function candidateTiers(entries, n) {
+      const tiers = [];
+      tiers.push(entries.filter(e => e.aliases.indexOf(n) !== -1));
+      const nc = n.replace(/ /g, '');
+      tiers.push(entries.filter(e => e.compacts.indexOf(nc) !== -1)); // «L'bankalik» = «Lbankalik»
+      if (n.length >= 4) {
+        let best = 0;
+        const inner = [];
+        entries.forEach(e => {
+          const len = e.aliases
+            .filter(x => x.length >= 4 && hasWords(n, x))
+            .reduce((m, x) => Math.max(m, x.length), 0);
+          if (!len) return;
+          inner.push({ e, len });
+          best = Math.max(best, len);
+        });
+        tiers.push(inner.filter(x => x.len === best).map(x => x.e));
+        tiers.push(entries.filter(e => e.aliases.some(x => hasWords(x, n))));
+      }
+      return tiers.filter(t => t.length);
+    }
+
     function findCandidates(entries, n) {
-      const exact = entries.filter(e => e.norm === n);
-      if (exact.length) return exact;
-      const parts = entries.filter(e => e.parts.indexOf(n) !== -1);
-      if (parts.length) return parts;
-      if (n.length < 4) return [];
-      // название из Confluence целиком входит в название из тикета:
-      // «sham cash» в «sham cash syp» — берём самые длинные (конкретные)
-      let best = 0;
-      const inner = [];
-      entries.forEach(e => {
-        const len = [e.norm].concat(e.parts)
-          .filter(a => a.length >= 4 && hasWords(n, a))
-          .reduce((m, a) => Math.max(m, a.length), 0);
-        if (!len) return;
-        inner.push({ e, len });
-        best = Math.max(best, len);
-      });
-      if (inner.length) return inner.filter(x => x.len === best).map(x => x.e);
-      // название из тикета входит в название из Confluence
-      return entries.filter(e => [e.norm].concat(e.parts).some(a => hasWords(a, n)));
+      return candidateTiers(entries, n)[0] || [];
     }
 
     // Варианты названия для поиска: method, method без кода валюты, subagent
@@ -369,7 +493,25 @@
       return out;
     }
 
-    // ticket: { method, subagent, country, currency } (или просто строка)
+    // Проект тикета (nameRef/refId) → строки Confluence этого проекта.
+    // webDefault — строки без бренда (или с webdefault в «Переключалке»);
+    // другой проект — строки с его названием или refId в «Переключалке».
+    function brandFilter(cands, ticket) {
+      const ref = normName(ticket.ref).replace(/ /g, '');
+      const refId = normSpace(ticket.refId);
+      if (!ref && !refId) return { list: cands, matched: false };
+      let list;
+      if (ref === 'webdefault' || (!ref && refId === '1')) {
+        const explicit = cands.filter(e => e.switchTokens.indexOf('webdefault') !== -1);
+        list = explicit.length ? explicit : cands.filter(e => !e.brandTags.length);
+      } else {
+        list = cands.filter(e => (ref && (e.brandTags.indexOf(ref) !== -1 || e.compact.indexOf(ref) !== -1))
+          || (refId && e.switchTokens.indexOf(refId) !== -1));
+      }
+      return list.length ? { list, matched: true } : { list: cands, matched: false };
+    }
+
+    // ticket: { method, subagent, country, currency, ref, refId } (или строка)
     // → { status: 'ok'|'nolimit'|'unparsed'|'ambiguous'|'nosubagent',
     //     limit, entries, via, countryMatched }
     function matchLimit(entries, overrides, ticket) {
@@ -385,34 +527,48 @@
           };
         }
       }
-      let cands = null;
-      let via = '';
-      for (const q of queries) {
-        const c = findCandidates(entries, q.n);
-        if (c.length) { cands = c; via = q.via; break; }
-      }
-      if (!cands) return { status: 'nolimit' };
-
-      // уточнение по стране тикета
-      let countryMatched = false;
+      // Перебираем варианты названия и уровни совпадения; лучший — где
+      // совпали и страна (2 балла), и проект (1 балл); при равенстве —
+      // самый точный (первый) вариант
+      const hasRef = !!(normName(ticket.ref) || normSpace(ticket.refId));
       const tk = countryKeys(ticket.country);
       const tn = normName(ticket.country);
-      if (tn) {
-        const byCountry = cands.filter(e => (tk.length
-          ? tk.some(k => e.countryKeys.indexOf(k) !== -1)
-          : hasWords(e.countryText, tn)));
-        if (byCountry.length) { cands = byCountry; countryMatched = true; }
+      const maxScore = (tn ? 2 : 0) + (hasRef ? 1 : 0);
+      let best = null;
+      outer:
+      for (const q of queries) {
+        for (const tier of candidateTiers(entries, q.n)) {
+          let list = tier;
+          let countryMatched = false;
+          if (tn) {
+            const byCountry = list.filter(e => (tk.length
+              ? tk.some(k => e.countryKeys.indexOf(k) !== -1)
+              : hasWords(e.countryText, tn)));
+            if (byCountry.length) { list = byCountry; countryMatched = true; }
+          }
+          const bf = brandFilter(list, ticket);
+          const score = (countryMatched ? 2 : 0) + (bf.matched ? 1 : 0);
+          if (!best || score > best.score) {
+            best = { cands: bf.list, via: q.via, countryMatched, brandMatched: bf.matched, score };
+          }
+          if (score >= maxScore) break outer;
+        }
       }
+      if (!best) return { status: 'nolimit' };
+      const cands = best.cands;
+      const via = best.via;
+      const countryMatched = best.countryMatched;
+      const brandMatched = best.brandMatched;
 
       const active = cands.filter(e => !e.striked);
       const pool = active.length ? active : cands;
       const parsed = pool.filter(hasLimit);
-      if (!parsed.length) return { status: 'unparsed', entries: pool, via, countryMatched };
+      if (!parsed.length) return { status: 'unparsed', entries: pool, via, countryMatched, brandMatched };
       const distinct = {};
       parsed.forEach(e => { if (!distinct[e.min + '|' + e.max]) distinct[e.min + '|' + e.max] = e; });
       const keys = Object.keys(distinct);
-      if (keys.length > 1) return { status: 'ambiguous', entries: parsed, via, countryMatched };
-      return { status: 'ok', limit: distinct[keys[0]], via, countryMatched };
+      if (keys.length > 1) return { status: 'ambiguous', entries: parsed, via, countryMatched, brandMatched };
+      return { status: 'ok', limit: distinct[keys[0]], via, countryMatched, brandMatched };
     }
 
     // → { verdict: 'below'|'above'|'ok', diff }
@@ -474,6 +630,16 @@
         keys: ['nameSubagent', 'subagentName', 'nameSubAgent', 'subAgentName', 'nameQuerySubagent', 'subagent', 'subAgent'],
         pats: [[/sub_?agent/i, /name/i], [/sub_?agent/i]],
         valid: isText,
+      },
+      ref: {
+        keys: ['nameRef', 'refName', 'nameProject'],
+        pats: [[/ref/i, /name/i]],
+        valid: isText,
+      },
+      refId: {
+        keys: ['refId', 'idRef', 'ref_id'],
+        pats: [[/^ref_?id$/i], [/^id_?ref$/i]],
+        valid: v => /^\d+$/.test(String(v == null ? '' : v).trim()),
       },
       country: {
         keys: ['nameCountry', 'countryName', 'country'],
@@ -554,7 +720,7 @@
 
     return {
       normSpace, normStatus, normName, parseAmount, parseNumberToken, extractNumbers,
-      parseLimitText, parseLimitRow, isHeaderRow, countryKeys, buildQueries, findCandidates,
+      parseLimitText, parseLimitRow, isHeaderRow, countryKeys, buildQueries, findCandidates, brandFilter,
       buildLimitIndex, normOverrides, matchLimit, evaluate,
       flattenRow, rankedKeys, detectKey, valuesEqual, pickKeyByValues, FIELD_DEFS,
     };
@@ -775,7 +941,7 @@
         ? 'Confluence вернул страницу входа — откройте doc.office.lan в браузере и залогиньтесь'
         : 'на странице Confluence не найдено таблиц');
     }
-    const entries = Core.buildLimitIndex(tables);
+    const entries = Core.buildLimitIndex(tables, CONFIG.knownBrands);
     limitIndex = { entries, tables, loadedAt: new Date() };
     const parsed = entries.filter(e => e.min != null || e.max != null).length;
     log('Лимиты загружены:', entries.length, 'строк, распознано', parsed, entries);
@@ -939,6 +1105,8 @@
       ticketId: String(row[k.ticketId] == null ? '' : row[k.ticketId]).trim(),
       method: val(k.method),
       subagent: val(k.subagent),
+      ref: val(k.ref),
+      refId: val(k.refId),
       amountRaw: row[k.amount],
       amount: Core.parseAmount(row[k.amount]),
       currency: val(k.currency),
@@ -946,7 +1114,7 @@
       userId: val(k.userId),
       status: val(k.status),
       min: null, max: null, diff: null, heading: '', limitName: '', limitCountry: '', limitRaw: '',
-      countryMatched: false, matchedBy: '', reason: '',
+      countryMatched: false, brandMatched: false, matchedBy: '', reason: '',
     };
     // все коды валют строки (currencyKode, currencyUserKode…) — чтобы
     // отрезать их от method: " Sham Cash SYP" → "Sham Cash"
@@ -956,7 +1124,9 @@
 
     const m = Core.matchLimit(limitIndex.entries, overrides, {
       method: rec.method, subagent: rec.subagent, country: rec.country, currency: rec.currency, currencies,
+      ref: rec.ref, refId: rec.refId,
     });
+    rec.brandMatched = !!m.brandMatched;
     rec.matchedBy = m.via || '';
     if (m.status !== 'ok') {
       rec.reason = UNCHECKED_REASONS[m.status] || m.status;
@@ -1112,15 +1282,15 @@
     }
 
     const num = v => (v == null || v === '' ? '' : Number(v));
-    const vHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Amount by receipt', 'Валюта', 'Min', 'Max', 'Отклонение', 'Country', 'User ID', 'Status', 'Метод в Confluence', 'Страна (Confluence)', 'Страна совпала', 'Лимит (как в Confluence)'];
-    const vRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, num(r.amount), r.currency, num(r.min), num(r.max), num(r.diff), r.country, r.userId, r.status, r.limitName, r.limitCountry, r.countryMatched ? 'да' : 'нет', r.limitRaw];
-    const uHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Amount by receipt', 'Валюта', 'Country', 'User ID', 'Status', 'Причина'];
-    const uRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, r.amount == null ? Core.normSpace(r.amountRaw) : r.amount, r.currency, r.country, r.userId, r.status, r.reason];
+    const vHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Ref', 'Amount by receipt', 'Валюта', 'Min', 'Max', 'Отклонение', 'Country', 'User ID', 'Status', 'Метод в Confluence', 'Страна (Confluence)', 'Страна совпала', 'Лимит (как в Confluence)'];
+    const vRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, r.ref, num(r.amount), r.currency, num(r.min), num(r.max), num(r.diff), r.country, r.userId, r.status, r.limitName, r.limitCountry, r.countryMatched ? 'да' : 'нет', r.limitRaw];
+    const uHeader = ['№', 'Ticket ID', 'Method', 'Subagent', 'Ref', 'Amount by receipt', 'Валюта', 'Country', 'User ID', 'Status', 'Причина'];
+    const uRow = (r, i) => [i + 1, r.ticketId, r.method, r.subagent, r.ref, r.amount == null ? Core.normSpace(r.amountRaw) : r.amount, r.currency, r.country, r.userId, r.status, r.reason];
 
     const wb = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(wb, sheet(vHeader, run.below.map(vRow), '2F5597', [4, 6, 7, 8]), 'Ниже лимита');
-    XLSX.utils.book_append_sheet(wb, sheet(vHeader, run.above.map(vRow), 'C55A11', [4, 6, 7, 8]), 'Выше лимита');
-    XLSX.utils.book_append_sheet(wb, sheet(uHeader, run.unchecked.map(uRow), '7F7F7F', [4]), 'Не удалось проверить');
+    XLSX.utils.book_append_sheet(wb, sheet(vHeader, run.below.map(vRow), '2F5597', [5, 7, 8, 9]), 'Ниже лимита');
+    XLSX.utils.book_append_sheet(wb, sheet(vHeader, run.above.map(vRow), 'C55A11', [5, 7, 8, 9]), 'Выше лимита');
+    XLSX.utils.book_append_sheet(wb, sheet(uHeader, run.unchecked.map(uRow), '7F7F7F', [5]), 'Не удалось проверить');
 
     // Сводка по методам (method + страна)
     const byMethod = {};
@@ -1202,6 +1372,15 @@
       li.tables.slice(0, 5).forEach((t, i) => out.push(`  Таблица ${i + 1} «${t.heading}»: колонки ${JSON.stringify(t.headers)}`));
       out.push('Примеры распознанных строк:');
       parsed.slice(0, 8).forEach(e => out.push(`  ${e.name} [${e.country}] → min ${fmtNum(e.min)}, max ${fmtNum(e.max)}${e.striked ? ' (зачёркнута)' : ''}`));
+      out.push(`Бренды (для выбора строки по nameRef): ${(li.entries.brands || []).join(', ') || '—'}`);
+      const noCountry = li.tables.filter(t => {
+        const ci = t.headers.findIndex((x, i) => i > 0 && /страна|country/i.test(x));
+        const cells = ci > 0 ? t.rows.map(r => r.cells[ci] || '').join(' ') : '';
+        return !Core.countryKeys(t.heading + ' ' + cells).length;
+      }).map(t => t.heading || '(без заголовка)');
+      if (noCountry.length) {
+        out.push(`Таблицы Confluence без распознанной страны (${noCountry.length}): ${noCountry.slice(0, 30).join(', ')}`);
+      }
       const bad = li.entries.filter(e => e.min == null && e.max == null);
       if (bad.length) {
         out.push(`Нераспознанные строки (${bad.length}), первые 10:`);
@@ -1223,11 +1402,11 @@
       const verdicts = { below: 'НИЖЕ лимита', above: 'ВЫШЕ лимита', ok: 'в лимите' };
       sample.forEach(r => {
         const { rec, verdict } = checkRow(r, overrides);
-        const head = `  #${rec.ticketId} | ${rec.method || '—'} | ${rec.country || '—'} | ${fmtNum(rec.amount)} ${rec.currency}`;
+        const head = `  #${rec.ticketId} | ${rec.method || '—'} | ${rec.country || '—'} | ${rec.ref || '—'} | ${fmtNum(rec.amount)} ${rec.currency}`;
         if (verdict === 'unchecked') {
           out.push(`${head}\n      → не проверен: ${rec.reason}`);
         } else {
-          out.push(`${head}\n      → «${rec.limitName}» [${rec.limitCountry}${rec.countryMatched ? '' : ', страна НЕ совпала'}] `
+          out.push(`${head}\n      → «${rec.limitName}» [${rec.limitCountry}${rec.countryMatched ? '' : ', страна НЕ совпала'}${rec.brandMatched ? `, проект ${rec.ref || rec.refId} совпал` : ''}] `
             + `min ${fmtNum(rec.min)} – max ${fmtNum(rec.max)} (по ${rec.matchedBy}) → ${verdicts[verdict]}`);
         }
       });
@@ -1346,7 +1525,7 @@
       <tr>
         <td class="muted">${i + 1}</td>
         <td><span class="tid" data-tid="${esc(r.ticketId)}" title="Скопировать">${esc(r.ticketId)}</span></td>
-        <td>${esc(r.method || r.subagent)}${r.method && r.subagent ? `<div class="muted">${esc(r.subagent)}</div>` : ''}</td>
+        <td>${esc(r.method || r.subagent)}<div class="muted">${esc([r.method ? r.subagent : '', r.ref].filter(Boolean).join(' · '))}</div></td>
         <td class="num">${fmtNum(r.amount)} ${esc(r.currency)}</td>
         <td class="num">${fmtNum(r.min)}</td>
         <td class="num">${fmtNum(r.max)}</td>
@@ -1363,7 +1542,7 @@
       <tr>
         <td class="muted">${i + 1}</td>
         <td><span class="tid" data-tid="${esc(r.ticketId)}" title="Скопировать">${esc(r.ticketId)}</span></td>
-        <td>${esc(r.method || r.subagent)}${r.method && r.subagent ? `<div class="muted">${esc(r.subagent)}</div>` : ''}</td>
+        <td>${esc(r.method || r.subagent)}<div class="muted">${esc([r.method ? r.subagent : '', r.ref].filter(Boolean).join(' · '))}</div></td>
         <td class="num">${r.amount == null ? esc(Core.normSpace(r.amountRaw)) : fmtNum(r.amount)} ${esc(r.currency)}</td>
         <td>${esc(r.country)}</td>
         <td>${esc(r.reason)}</td>
