@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.13
-// @description  Проходит все страницы текущего фильтра, берёт тикеты в статусах Credited (M) и Credited (Fraud) (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
+// @version      1.14
+// @description  Проходит все страницы текущего фильтра, берёт тикеты в статусах Credited (M), Credited (Fraud) (M) и Closed (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://managment.io/*/admin/backoffice/paymentsupport*
@@ -28,7 +28,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.13';
+  const VERSION = '1.14';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -40,7 +40,7 @@
 
     // Какие статусы проверяем. Сравнение без регистра и пробелов, числовой
     // префикс вида "207 - " отбрасывается.
-    statuses: ['Credited (M)', 'Credited (Fraud) (M)'],
+    statuses: ['Credited (M)', 'Credited (Fraud) (M)', 'Closed (M)'],
 
     // Ключи полей в JSON-ответе списка. null — определить автоматически:
     // сначала по таблице на экране (Ticket ID / Subagent / Amount by

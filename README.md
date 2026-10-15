@@ -2,7 +2,7 @@
 
 Tampermonkey-скрипт **TH Management — Limit Mistake Finder** (`limit-mistake-finder.user.js`).
 
-Проходит **все страницы** текущего фильтра на `paymentsupport` и `ExtendedPaymentRequestList`, берёт тикеты в статусах **Credited (M)** и **Credited (Fraud) (M)** и сравнивает **Amount by receipt** (поле `amount`) с лимитами их **метода** со страницы Confluence «ЛИМИТЫ РУЧНЫЕ» с учётом страны. Тикеты ниже или выше лимита показываются списком, и их можно скачать в Excel.
+Проходит **все страницы** текущего фильтра на `paymentsupport` и `ExtendedPaymentRequestList`, берёт тикеты в статусах **Credited (M)**, **Credited (Fraud) (M)** и **Closed (M)** и сравнивает **Amount by receipt** (поле `amount`) с лимитами их **метода** со страницы Confluence «ЛИМИТЫ РУЧНЫЕ» с учётом страны. Тикеты ниже или выше лимита показываются списком, и их можно скачать в Excel.
 
 ## Установка
 1. Установить расширение Tampermonkey.
@@ -13,7 +13,7 @@ Tampermonkey-скрипт **TH Management — Limit Mistake Finder** (`limit-mis
 Обновления приходят автоматически (Tampermonkey проверяет `@updateURL`), вручную — «Проверить обновления» в меню Tampermonkey.
 
 ## Как пользоваться
-1. Открыть List of payment queries (или Extended) и задать фильтр. Чтобы проверка шла быстрее, можно сразу отфильтровать по статусу Credited (M).
+1. Открыть List of payment queries (или Extended) и задать фильтр. Чтобы проверка шла быстрее, можно сразу отфильтровать по нужным статусам (Credited (M), Credited (Fraud) (M), Closed (M)).
 2. Нажать **APPLY**: скрипт перехватит запрос списка (в панели появится «✅ Фильтр пойман»).
 3. Открыть панель кнопкой **Limits** справа внизу (или Alt+L) → **▶ Проверить все страницы**.
 4. Результаты на вкладках:
@@ -54,11 +54,11 @@ Tampermonkey-скрипт **TH Management — Limit Mistake Finder** (`limit-mis
 «Диагностика» показывает:
 - какие ключи выбраны (с примерами значений);
 - как разобрались таблицы Confluence: что распознано, а что нет;
-- **проверку сопоставления**: для тикетов Credited (M) со стр. 1 видно, в какую строку Confluence попал каждый тикет, с какими min/max и с каким вердиктом;
+- **проверку сопоставления**: для тикетов нужных статусов со стр. 1 видно, в какую строку Confluence попал каждый тикет, с какими min/max и с каким вердиктом;
 - все ключи первой строки ответа.
 
 ## Настройки (блок `CONFIG` в начале скрипта)
-- `statuses` — какие статусы проверять (по умолчанию `['Credited (M)']`).
+- `statuses` — какие статусы проверять (по умолчанию `['Credited (M)', 'Credited (Fraud) (M)', 'Closed (M)']`).
 - `fields` — явно задать ключ JSON. По умолчанию `amount: 'amount'` (Amount by receipt); для суммы транзакции было бы `'summa'`.
 - `knownBrands` — список брендов/проектов для выбора строки по `nameRef`.
 - `limitOverrides` — ручные лимиты, они важнее Confluence; ключ — method или subagent: `'Sham Cash SYP': { min: 100, max: 30000 }`.
