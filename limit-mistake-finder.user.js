@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.15
-// @description  Проходит все страницы текущего фильтра, берёт тикеты в статусах Credited (M), Credited (Fraud) (M) и Closed (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
+// @version      1.16
+// @description  Проходит все страницы текущего фильтра, берёт тикеты в статусах Credited (M), Credited (Fraud) (M) и Closed (M) с транзакцией в статусе OK и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://managment.io/*/admin/backoffice/paymentsupport*
@@ -28,7 +28,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.15';
+  const VERSION = '1.16';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -41,6 +41,12 @@
     // Какие статусы проверяем. Сравнение без регистра и пробелов, числовой
     // префикс вида "207 - " отбрасывается.
     statuses: ['Credited (M)', 'Credited (Fraud) (M)', 'Closed (M)'],
+
+    // Статус транзакции (поле transactionStatusName: Pending / Rejected / OK).
+    // Проверяем только тикеты с транзакцией в этих статусах: нет зачисления —
+    // нечего сверять с лимитом. Тикеты без транзакции тоже пропускаются.
+    // [] — не фильтровать по транзакции.
+    txnStatuses: ['OK'],
 
     // Ключи полей в JSON-ответе списка. null — определить автоматически:
     // сначала по таблице на экране (Ticket ID / Subagent / Amount by
@@ -60,6 +66,7 @@
       country: null,
       userId: null,
       currency: null,
+      txnStatus: null, // статус транзакции (transactionStatusName)
     },
 
     // Заголовки колонок таблицы на экране — по ним сверяем ключи JSON.
@@ -1015,6 +1022,11 @@
         pats: [[/currency/i, /name|code/i], [/currency/i]],
         valid: isText,
       },
+      txnStatus: {
+        keys: ['transactionStatusName', 'nameTransactionStatus', 'transactionStatus', 'statusTransaction'],
+        pats: [[/transaction/i, /status/i, /name/i]],
+        valid: isText,
+      },
     };
 
     function allKeys(rows) {
@@ -1439,6 +1451,8 @@
     above: [],
     unchecked: [],
     manual: [], // в лимите, но строка Confluence взята другой страны/проекта
+    skippedTxn: 0, // нужный статус, но транзакция не OK — не проверяли
+    skippedTxnBy: {}, // статус транзакции → сколько
     startedAt: null,
     finishedAt: null,
     complete: false,
@@ -1518,9 +1532,26 @@
     return { rec, verdict: ev.verdict };
   }
 
+  // Транзакция не в статусе OK (Pending / Rejected / нет транзакции) —
+  // зачисления не было, сверять с лимитом нечего. Если поле статуса
+  // транзакции не найдено, проверяем всё, как раньше
+  function txnSkipReason(row) {
+    const key = run.keys.txnStatus;
+    if (!key || !CONFIG.txnStatuses.length) return '';
+    const ts = Core.normSpace(row[key]);
+    const ok = CONFIG.txnStatuses.some(x => Core.normSpace(x).toLowerCase() === ts.toLowerCase());
+    return ok ? '' : (ts || 'нет транзакции');
+  }
+
   function processRow(row, overrides) {
     if (!isWantedStatus(row[run.keys.status])) return;
     run.matched++;
+    const skip = txnSkipReason(row);
+    if (skip) {
+      run.skippedTxn++;
+      run.skippedTxnBy[skip] = (run.skippedTxnBy[skip] || 0) + 1;
+      return;
+    }
     const { rec, verdict } = checkRow(row, overrides);
     if (verdict === 'below') run.below.push(rec);
     else if (verdict === 'above') run.above.push(rec);
@@ -1544,7 +1575,7 @@
     }
     Object.assign(run, {
       running: true, stopRequested: false, page: 0, seen: 0, matched: 0,
-      below: [], above: [], unchecked: [], manual: [], startedAt: new Date(), finishedAt: null, complete: false, error: '',
+      below: [], above: [], unchecked: [], manual: [], skippedTxn: 0, skippedTxnBy: {}, startedAt: new Date(), finishedAt: null, complete: false, error: '',
       keys: null, source: null,
     });
     setBusy(true);
@@ -1603,6 +1634,10 @@
     finishRun();
   }
 
+  function skippedTxnText() {
+    return Object.keys(run.skippedTxnBy).map(k => `${k}: ${run.skippedTxnBy[k]}`).join(', ');
+  }
+
   function finishRun() {
     run.running = false;
     run.finishedAt = new Date();
@@ -1615,7 +1650,7 @@
     } else if (run.stopRequested && !run.complete) {
       setStatus(`⏹ Остановлено на стр. ${run.page}. Нарушений: ${total}`);
     } else {
-      setStatus(`✅ Готово: ${run.page} стр., ${run.seen} тикетов, в нужном статусе: ${run.matched}, нарушений: ${total}`);
+      setStatus(`✅ Готово: ${run.page} стр., ${run.seen} тикетов, в нужном статусе: ${run.matched}${run.skippedTxn ? ` (транзакция не OK: ${run.skippedTxn})` : ''}, нарушений: ${total}`);
       showToast(`Готово. Ниже лимита: ${run.below.length}, выше: ${run.above.length}`, 'ok');
     }
   }
@@ -1692,6 +1727,8 @@
       ['Страниц просмотрено', run.page],
       ['Тикетов просмотрено', run.seen],
       ['Тикетов в нужном статусе', run.matched],
+      [`Пропущено: транзакция не ${CONFIG.txnStatuses.join('/') || '—'}`, run.skippedTxn + (run.skippedTxn ? ` (${skippedTxnText()})` : '')],
+      ['Проверено по лимитам', run.matched - run.skippedTxn],
       ['Ниже лимита', run.below.length],
       ['Выше лимита', run.above.length],
       ['Не удалось проверить', run.unchecked.length],
@@ -1790,8 +1827,14 @@
       out.push('  (формат: #тикет | method | subagent | страна | проект | сумма)');
       if (!sample.length) out.push('  на странице нет тикетов в этом статусе');
       const verdicts = { below: 'НИЖЕ лимита', above: 'ВЫШЕ лимита', ok: 'в лимите' };
+      if (!det.keys.txnStatus && CONFIG.txnStatuses.length) out.push('  ⚠ поле статуса транзакции не найдено — тикеты проверяются без фильтра по транзакции');
       sample.forEach(r => {
+        const skip = txnSkipReason(r);
         const { rec, verdict } = checkRow(r, overrides);
+        if (skip) {
+          out.push(`  #${rec.ticketId} | ${rec.method || '—'} | ${rec.subagent || '—'} | ${fmtNum(rec.amount)} ${rec.currency}\n      → пропущен: транзакция ${skip}`);
+          return;
+        }
         const head = `  #${rec.ticketId} | ${rec.method || '—'} | ${rec.subagent || '—'} | ${rec.country || '—'} | ${rec.ref || '—'} | ${fmtNum(rec.amount)} ${rec.currency}`;
         if (verdict === 'unchecked') {
           out.push(`${head}\n      → не проверен: ${rec.reason}`);
@@ -1843,7 +1886,7 @@
     #lmf-capture{font-size:11px;padding:6px 10px;border-radius:7px;margin-left:auto;}
     #lmf-capture.ok{color:#7ee0a5;background:rgba(63,200,120,.08);border:1px solid rgba(63,200,120,.3);}
     #lmf-capture.no{color:#f0a500;background:rgba(240,165,0,.08);border:1px solid rgba(240,165,0,.3);}
-    #lmf-metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;padding:12px 18px;}
+    #lmf-metrics{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;padding:12px 18px;}
     .lmf-m{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:9px;padding:8px;text-align:center;}
     .lmf-m b{display:block;font-size:20px;color:#fff;font-variant-numeric:tabular-nums;}
     .lmf-m span{font-size:9px;color:#9a93c8;text-transform:uppercase;letter-spacing:.6px;}
@@ -1950,6 +1993,8 @@
       $('m-pages').textContent = run.page || '—';
       $('m-seen').textContent = run.seen || '—';
       $('m-matched').textContent = run.matched || '—';
+      $('m-skip').textContent = run.skippedTxn;
+      $('m-skip').parentNode.title = run.skippedTxn ? skippedTxnText() : '';
       $('m-below').textContent = run.below.length;
       $('m-above').textContent = run.above.length;
       $('m-unk').textContent = run.unchecked.length;
@@ -2006,6 +2051,7 @@
           <div class="lmf-m below"><b id="m-below">0</b><span>Ниже лимита</span></div>
           <div class="lmf-m above"><b id="m-above">0</b><span>Выше лимита</span></div>
           <div class="lmf-m unk"><b id="m-unk">0</b><span>Не проверено</span></div>
+          <div class="lmf-m"><b id="m-skip">0</b><span>Транзакция не OK</span></div>
         </div>
         <div id="lmf-tabs">
           <button class="lmf-tab on" data-tab="below" id="t-below">Ниже лимита</button>
