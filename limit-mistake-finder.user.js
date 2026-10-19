@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.14
-// @description  Проходит все страницы текущего фильтра, берёт тикеты в статусах Credited (M), Credited (Fraud) (M) и Closed (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
+// @version      1.16
+// @description  Проходит все страницы текущего фильтра, берёт тикеты в статусах Credited (M), Credited (Fraud) (M) и Closed (M) с транзакцией в статусе OK и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://managment.io/*/admin/backoffice/paymentsupport*
@@ -28,7 +28,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.14';
+  const VERSION = '1.16';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -41,6 +41,12 @@
     // Какие статусы проверяем. Сравнение без регистра и пробелов, числовой
     // префикс вида "207 - " отбрасывается.
     statuses: ['Credited (M)', 'Credited (Fraud) (M)', 'Closed (M)'],
+
+    // Статус транзакции (поле transactionStatusName: Pending / Rejected / OK).
+    // Проверяем только тикеты с транзакцией в этих статусах: нет зачисления —
+    // нечего сверять с лимитом. Тикеты без транзакции тоже пропускаются.
+    // [] — не фильтровать по транзакции.
+    txnStatuses: ['OK'],
 
     // Ключи полей в JSON-ответе списка. null — определить автоматически:
     // сначала по таблице на экране (Ticket ID / Subagent / Amount by
@@ -60,6 +66,7 @@
       country: null,
       userId: null,
       currency: null,
+      txnStatus: null, // статус транзакции (transactionStatusName)
     },
 
     // Заголовки колонок таблицы на экране — по ним сверяем ключи JSON.
@@ -203,6 +210,13 @@
       return t.slice(0, wd);
     }
 
+    // Коды валют в разделе депозита: «min 2 USD - max 300 USD» → ['usd']
+    function limitCurrencies(text) {
+      const m = depositSection(normSpace(text)).match(/\b[A-Z]{3}\b/g) || [];
+      return m.filter(x => !/^(MIN|MAX|DEP)$/.test(x))
+        .map(x => x.toLowerCase()).filter((x, i, arr) => arr.indexOf(x) === i);
+    }
+
     function parseLimitText(text) {
       const t = depositSection(normSpace(text));
       if (!t) return { min: null, max: null };
@@ -257,7 +271,15 @@
         if (isMin && min == null) min = n;
         if (isMax && max == null) max = n;
       }
-      if (min != null || max != null) return { min, max };
+      if (min != null || max != null) {
+        const curs = [];
+        for (let i = 1; i < cells.length; i++) {
+          if (!COL_SKIP_RE.test(h[i] || '') && (COL_MIN_RE.test(h[i] || '') || COL_MAX_RE.test(h[i] || ''))) {
+            limitCurrencies(cells[i]).forEach(c => { if (curs.indexOf(c) === -1) curs.push(c); });
+          }
+        }
+        return { min, max, curs };
+      }
 
       const cols = [];
       for (let i = 1; i < cells.length; i++) {
@@ -266,9 +288,9 @@
       const limitish = cols.filter(i => COL_LIMIT_RE.test(h[i] || ''));
       for (const i of (limitish.length ? limitish : cols)) {
         const r = parseLimitText(cells[i]);
-        if (r.min != null || r.max != null) return r;
+        if (r.min != null || r.max != null) return Object.assign(r, { curs: limitCurrencies(cells[i]) });
       }
-      return { min: null, max: null };
+      return { min: null, max: null, curs: [] };
     }
 
     // ── Страны: название в тикете (англ.) ↔ таблица/колонка в Confluence ──
@@ -537,6 +559,7 @@
             ownSub: /\s\d{4,}\s*$/.test(name) ? subItem(name) : null,
             min: lim.min,
             max: lim.max,
+            limitCurs: lim.curs || [], // валюта лимита: ['usd']
             heading,
             country: countryCell || heading,
             countryText: normName(countryCell + ' ' + heading),
@@ -720,7 +743,7 @@
     }
 
     // ticket: { method, subagent, country, currency, ref, refId } (или строка)
-    // → { status: 'ok'|'nolimit'|'unparsed'|'ambiguous'|'nosubagent',
+    // → { status: 'ok'|'nolimit'|'unparsed'|'ambiguous'|'currency'|'nosubagent',
     //     limit, entries, via, countryMatched }
     function matchLimit(entries, overrides, ticket) {
       if (typeof ticket === 'string') ticket = { subagent: ticket };
@@ -796,9 +819,18 @@
       // Сначала валюта платежа (currencyKode), потом все коды (валюта
       // счёта currencyUserKode может отличаться: платёж SYP, счёт USD)
       const primaryCode = normSpace(ticket.currency).toLowerCase();
+      const curOf = (e, c) => hasWords(e.norm, c) || (e.limitCurs || []).indexOf(c) !== -1;
+      // строка-«двойник» в другой валюте из той же таблицы: нашлась «Whish»
+      // (лимит в USD), а тикет в LBP → добавляем «Whish LBP»
+      if (primaryCode && !cands.some(e => curOf(e, primaryCode))) {
+        const bare = e => e.norm.split(' ').filter(w => w !== primaryCode && (e.limitCurs || []).indexOf(w) === -1).join(' ');
+        const twins = entries.filter(e => cands.indexOf(e) === -1 && curOf(e, primaryCode)
+          && cands.some(c => c.heading === e.heading && bare(c) === bare(e)));
+        if (twins.length) cands = cands.concat(twins);
+      }
       for (const set of [primaryCode ? [primaryCode] : [], codes]) {
         if (!set.length || cands.length < 2) continue;
-        const byCur = cands.filter(e => set.some(c => hasWords(e.norm, c) || hasWords(e.rawNorm, c)));
+        const byCur = cands.filter(e => set.some(c => curOf(e, c) || hasWords(e.rawNorm, c)));
         if (byCur.length && byCur.length < cands.length) { cands = byCur; break; }
       }
       const via = best.via;
@@ -888,7 +920,16 @@
       parsed.forEach(e => { if (!distinct[e.min + '|' + e.max]) distinct[e.min + '|' + e.max] = e; });
       const keys = Object.keys(distinct);
       if (keys.length > 1) return { status: 'ambiguous', entries: parsed, via, countryMatched, brandMatched, subMatched, subsChecked, note, info };
-      return { status: 'ok', limit: distinct[keys[0]], via, countryMatched, brandMatched, subMatched, note, info };
+      const limit = distinct[keys[0]];
+      // лимит в другой валюте (USD, а платёж в LBP) — суммы не сравнить
+      const lc = limit.limitCurs || [];
+      if (primaryCode && lc.length && lc.indexOf(primaryCode) === -1) {
+        return {
+          status: 'currency', entries: [limit], via, countryMatched, brandMatched, subMatched, note, info,
+          reasonExtra: `лимит в ${lc.join('/').toUpperCase()}, тикет в ${primaryCode.toUpperCase()}`,
+        };
+      }
+      return { status: 'ok', limit, via, countryMatched, brandMatched, subMatched, note, info };
     }
 
     // → { verdict: 'below'|'above'|'ok', diff }
@@ -979,6 +1020,11 @@
       currency: {
         keys: ['currencyKode', 'nameCurrency', 'currencyCode', 'codeCurrency', 'currency'],
         pats: [[/currency/i, /name|code/i], [/currency/i]],
+        valid: isText,
+      },
+      txnStatus: {
+        keys: ['transactionStatusName', 'nameTransactionStatus', 'transactionStatus', 'statusTransaction'],
+        pats: [[/transaction/i, /status/i, /name/i]],
         valid: isText,
       },
     };
@@ -1405,6 +1451,8 @@
     above: [],
     unchecked: [],
     manual: [], // в лимите, но строка Confluence взята другой страны/проекта
+    skippedTxn: 0, // нужный статус, но транзакция не OK — не проверяли
+    skippedTxnBy: {}, // статус транзакции → сколько
     startedAt: null,
     finishedAt: null,
     complete: false,
@@ -1416,6 +1464,7 @@
     nolimit: 'метод не найден в Confluence',
     unparsed: 'лимит в Confluence не распознан',
     ambiguous: 'несколько строк с разными лимитами',
+    currency: 'валюта лимита в Confluence не совпадает с валютой тикета',
     noamount: 'не удалось прочитать сумму',
   };
 
@@ -1483,9 +1532,26 @@
     return { rec, verdict: ev.verdict };
   }
 
+  // Транзакция не в статусе OK (Pending / Rejected / нет транзакции) —
+  // зачисления не было, сверять с лимитом нечего. Если поле статуса
+  // транзакции не найдено, проверяем всё, как раньше
+  function txnSkipReason(row) {
+    const key = run.keys.txnStatus;
+    if (!key || !CONFIG.txnStatuses.length) return '';
+    const ts = Core.normSpace(row[key]);
+    const ok = CONFIG.txnStatuses.some(x => Core.normSpace(x).toLowerCase() === ts.toLowerCase());
+    return ok ? '' : (ts || 'нет транзакции');
+  }
+
   function processRow(row, overrides) {
     if (!isWantedStatus(row[run.keys.status])) return;
     run.matched++;
+    const skip = txnSkipReason(row);
+    if (skip) {
+      run.skippedTxn++;
+      run.skippedTxnBy[skip] = (run.skippedTxnBy[skip] || 0) + 1;
+      return;
+    }
     const { rec, verdict } = checkRow(row, overrides);
     if (verdict === 'below') run.below.push(rec);
     else if (verdict === 'above') run.above.push(rec);
@@ -1509,7 +1575,7 @@
     }
     Object.assign(run, {
       running: true, stopRequested: false, page: 0, seen: 0, matched: 0,
-      below: [], above: [], unchecked: [], manual: [], startedAt: new Date(), finishedAt: null, complete: false, error: '',
+      below: [], above: [], unchecked: [], manual: [], skippedTxn: 0, skippedTxnBy: {}, startedAt: new Date(), finishedAt: null, complete: false, error: '',
       keys: null, source: null,
     });
     setBusy(true);
@@ -1568,6 +1634,10 @@
     finishRun();
   }
 
+  function skippedTxnText() {
+    return Object.keys(run.skippedTxnBy).map(k => `${k}: ${run.skippedTxnBy[k]}`).join(', ');
+  }
+
   function finishRun() {
     run.running = false;
     run.finishedAt = new Date();
@@ -1580,7 +1650,7 @@
     } else if (run.stopRequested && !run.complete) {
       setStatus(`⏹ Остановлено на стр. ${run.page}. Нарушений: ${total}`);
     } else {
-      setStatus(`✅ Готово: ${run.page} стр., ${run.seen} тикетов, в нужном статусе: ${run.matched}, нарушений: ${total}`);
+      setStatus(`✅ Готово: ${run.page} стр., ${run.seen} тикетов, в нужном статусе: ${run.matched}${run.skippedTxn ? ` (транзакция не OK: ${run.skippedTxn})` : ''}, нарушений: ${total}`);
       showToast(`Готово. Ниже лимита: ${run.below.length}, выше: ${run.above.length}`, 'ok');
     }
   }
@@ -1657,6 +1727,8 @@
       ['Страниц просмотрено', run.page],
       ['Тикетов просмотрено', run.seen],
       ['Тикетов в нужном статусе', run.matched],
+      [`Пропущено: транзакция не ${CONFIG.txnStatuses.join('/') || '—'}`, run.skippedTxn + (run.skippedTxn ? ` (${skippedTxnText()})` : '')],
+      ['Проверено по лимитам', run.matched - run.skippedTxn],
       ['Ниже лимита', run.below.length],
       ['Выше лимита', run.above.length],
       ['Не удалось проверить', run.unchecked.length],
@@ -1755,8 +1827,14 @@
       out.push('  (формат: #тикет | method | subagent | страна | проект | сумма)');
       if (!sample.length) out.push('  на странице нет тикетов в этом статусе');
       const verdicts = { below: 'НИЖЕ лимита', above: 'ВЫШЕ лимита', ok: 'в лимите' };
+      if (!det.keys.txnStatus && CONFIG.txnStatuses.length) out.push('  ⚠ поле статуса транзакции не найдено — тикеты проверяются без фильтра по транзакции');
       sample.forEach(r => {
+        const skip = txnSkipReason(r);
         const { rec, verdict } = checkRow(r, overrides);
+        if (skip) {
+          out.push(`  #${rec.ticketId} | ${rec.method || '—'} | ${rec.subagent || '—'} | ${fmtNum(rec.amount)} ${rec.currency}\n      → пропущен: транзакция ${skip}`);
+          return;
+        }
         const head = `  #${rec.ticketId} | ${rec.method || '—'} | ${rec.subagent || '—'} | ${rec.country || '—'} | ${rec.ref || '—'} | ${fmtNum(rec.amount)} ${rec.currency}`;
         if (verdict === 'unchecked') {
           out.push(`${head}\n      → не проверен: ${rec.reason}`);
@@ -1808,7 +1886,7 @@
     #lmf-capture{font-size:11px;padding:6px 10px;border-radius:7px;margin-left:auto;}
     #lmf-capture.ok{color:#7ee0a5;background:rgba(63,200,120,.08);border:1px solid rgba(63,200,120,.3);}
     #lmf-capture.no{color:#f0a500;background:rgba(240,165,0,.08);border:1px solid rgba(240,165,0,.3);}
-    #lmf-metrics{display:grid;grid-template-columns:repeat(6,1fr);gap:8px;padding:12px 18px;}
+    #lmf-metrics{display:grid;grid-template-columns:repeat(7,1fr);gap:8px;padding:12px 18px;}
     .lmf-m{background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.08);border-radius:9px;padding:8px;text-align:center;}
     .lmf-m b{display:block;font-size:20px;color:#fff;font-variant-numeric:tabular-nums;}
     .lmf-m span{font-size:9px;color:#9a93c8;text-transform:uppercase;letter-spacing:.6px;}
@@ -1915,6 +1993,8 @@
       $('m-pages').textContent = run.page || '—';
       $('m-seen').textContent = run.seen || '—';
       $('m-matched').textContent = run.matched || '—';
+      $('m-skip').textContent = run.skippedTxn;
+      $('m-skip').parentNode.title = run.skippedTxn ? skippedTxnText() : '';
       $('m-below').textContent = run.below.length;
       $('m-above').textContent = run.above.length;
       $('m-unk').textContent = run.unchecked.length;
@@ -1971,6 +2051,7 @@
           <div class="lmf-m below"><b id="m-below">0</b><span>Ниже лимита</span></div>
           <div class="lmf-m above"><b id="m-above">0</b><span>Выше лимита</span></div>
           <div class="lmf-m unk"><b id="m-unk">0</b><span>Не проверено</span></div>
+          <div class="lmf-m"><b id="m-skip">0</b><span>Транзакция не OK</span></div>
         </div>
         <div id="lmf-tabs">
           <button class="lmf-tab on" data-tab="below" id="t-below">Ниже лимита</button>
