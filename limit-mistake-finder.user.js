@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.14
+// @version      1.15
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусах Credited (M), Credited (Fraud) (M) и Closed (M) и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -28,7 +28,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.14';
+  const VERSION = '1.15';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -203,6 +203,13 @@
       return t.slice(0, wd);
     }
 
+    // Коды валют в разделе депозита: «min 2 USD - max 300 USD» → ['usd']
+    function limitCurrencies(text) {
+      const m = depositSection(normSpace(text)).match(/\b[A-Z]{3}\b/g) || [];
+      return m.filter(x => !/^(MIN|MAX|DEP)$/.test(x))
+        .map(x => x.toLowerCase()).filter((x, i, arr) => arr.indexOf(x) === i);
+    }
+
     function parseLimitText(text) {
       const t = depositSection(normSpace(text));
       if (!t) return { min: null, max: null };
@@ -257,7 +264,15 @@
         if (isMin && min == null) min = n;
         if (isMax && max == null) max = n;
       }
-      if (min != null || max != null) return { min, max };
+      if (min != null || max != null) {
+        const curs = [];
+        for (let i = 1; i < cells.length; i++) {
+          if (!COL_SKIP_RE.test(h[i] || '') && (COL_MIN_RE.test(h[i] || '') || COL_MAX_RE.test(h[i] || ''))) {
+            limitCurrencies(cells[i]).forEach(c => { if (curs.indexOf(c) === -1) curs.push(c); });
+          }
+        }
+        return { min, max, curs };
+      }
 
       const cols = [];
       for (let i = 1; i < cells.length; i++) {
@@ -266,9 +281,9 @@
       const limitish = cols.filter(i => COL_LIMIT_RE.test(h[i] || ''));
       for (const i of (limitish.length ? limitish : cols)) {
         const r = parseLimitText(cells[i]);
-        if (r.min != null || r.max != null) return r;
+        if (r.min != null || r.max != null) return Object.assign(r, { curs: limitCurrencies(cells[i]) });
       }
-      return { min: null, max: null };
+      return { min: null, max: null, curs: [] };
     }
 
     // ── Страны: название в тикете (англ.) ↔ таблица/колонка в Confluence ──
@@ -537,6 +552,7 @@
             ownSub: /\s\d{4,}\s*$/.test(name) ? subItem(name) : null,
             min: lim.min,
             max: lim.max,
+            limitCurs: lim.curs || [], // валюта лимита: ['usd']
             heading,
             country: countryCell || heading,
             countryText: normName(countryCell + ' ' + heading),
@@ -720,7 +736,7 @@
     }
 
     // ticket: { method, subagent, country, currency, ref, refId } (или строка)
-    // → { status: 'ok'|'nolimit'|'unparsed'|'ambiguous'|'nosubagent',
+    // → { status: 'ok'|'nolimit'|'unparsed'|'ambiguous'|'currency'|'nosubagent',
     //     limit, entries, via, countryMatched }
     function matchLimit(entries, overrides, ticket) {
       if (typeof ticket === 'string') ticket = { subagent: ticket };
@@ -796,9 +812,18 @@
       // Сначала валюта платежа (currencyKode), потом все коды (валюта
       // счёта currencyUserKode может отличаться: платёж SYP, счёт USD)
       const primaryCode = normSpace(ticket.currency).toLowerCase();
+      const curOf = (e, c) => hasWords(e.norm, c) || (e.limitCurs || []).indexOf(c) !== -1;
+      // строка-«двойник» в другой валюте из той же таблицы: нашлась «Whish»
+      // (лимит в USD), а тикет в LBP → добавляем «Whish LBP»
+      if (primaryCode && !cands.some(e => curOf(e, primaryCode))) {
+        const bare = e => e.norm.split(' ').filter(w => w !== primaryCode && (e.limitCurs || []).indexOf(w) === -1).join(' ');
+        const twins = entries.filter(e => cands.indexOf(e) === -1 && curOf(e, primaryCode)
+          && cands.some(c => c.heading === e.heading && bare(c) === bare(e)));
+        if (twins.length) cands = cands.concat(twins);
+      }
       for (const set of [primaryCode ? [primaryCode] : [], codes]) {
         if (!set.length || cands.length < 2) continue;
-        const byCur = cands.filter(e => set.some(c => hasWords(e.norm, c) || hasWords(e.rawNorm, c)));
+        const byCur = cands.filter(e => set.some(c => curOf(e, c) || hasWords(e.rawNorm, c)));
         if (byCur.length && byCur.length < cands.length) { cands = byCur; break; }
       }
       const via = best.via;
@@ -888,7 +913,16 @@
       parsed.forEach(e => { if (!distinct[e.min + '|' + e.max]) distinct[e.min + '|' + e.max] = e; });
       const keys = Object.keys(distinct);
       if (keys.length > 1) return { status: 'ambiguous', entries: parsed, via, countryMatched, brandMatched, subMatched, subsChecked, note, info };
-      return { status: 'ok', limit: distinct[keys[0]], via, countryMatched, brandMatched, subMatched, note, info };
+      const limit = distinct[keys[0]];
+      // лимит в другой валюте (USD, а платёж в LBP) — суммы не сравнить
+      const lc = limit.limitCurs || [];
+      if (primaryCode && lc.length && lc.indexOf(primaryCode) === -1) {
+        return {
+          status: 'currency', entries: [limit], via, countryMatched, brandMatched, subMatched, note, info,
+          reasonExtra: `лимит в ${lc.join('/').toUpperCase()}, тикет в ${primaryCode.toUpperCase()}`,
+        };
+      }
+      return { status: 'ok', limit, via, countryMatched, brandMatched, subMatched, note, info };
     }
 
     // → { verdict: 'below'|'above'|'ok', diff }
@@ -1416,6 +1450,7 @@
     nolimit: 'метод не найден в Confluence',
     unparsed: 'лимит в Confluence не распознан',
     ambiguous: 'несколько строк с разными лимитами',
+    currency: 'валюта лимита в Confluence не совпадает с валютой тикета',
     noamount: 'не удалось прочитать сумму',
   };
 
