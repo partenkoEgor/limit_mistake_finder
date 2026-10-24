@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.16
+// @version      1.17
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусах Credited (M), Credited (Fraud) (M) и Closed (M) с транзакцией в статусе OK и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -28,7 +28,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.16';
+  const VERSION = '1.17';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -939,6 +939,23 @@
       return { verdict: 'ok', diff: 0 };
     }
 
+    // Несколько строк с разными лимитами (например, таблицы «Турция Melbet
+    // BT» и «Турция Melbet API»), но по каждой сумма даёт один и тот же
+    // вердикт — тогда он однозначен. Для нарушения берём самую мягкую
+    // границу: самый маленький min / самый большой max
+    function consensus(amount, entries, currency) {
+      if (amount == null || !entries || entries.length < 2) return null;
+      const cur = normSpace(currency).toLowerCase();
+      if (cur && entries.some(e => (e.limitCurs || []).length && e.limitCurs.indexOf(cur) === -1)) return null;
+      const verdicts = entries.map(e => evaluate(amount, e).verdict);
+      if (verdicts.some(v => v !== verdicts[0])) return null;
+      const verdict = verdicts[0];
+      let limit = entries[0];
+      if (verdict === 'below') limit = entries.reduce((a, e) => (e.min < a.min ? e : a));
+      if (verdict === 'above') limit = entries.reduce((a, e) => (e.max > a.max ? e : a));
+      return { verdict, limit, diff: evaluate(amount, limit).diff };
+    }
+
     // ── Поля строки списка ────────────────────────────────────────────
 
     function isObj(x) { return x && typeof x === 'object' && !Array.isArray(x); }
@@ -1092,7 +1109,7 @@
     return {
       normSpace, normStatus, normName, parseAmount, parseNumberToken, extractNumbers,
       parseLimitText, parseLimitRow, parseSubsCell, isHeaderRow, countryKeys, buildQueries, findCandidates, brandFilter,
-      buildLimitIndex, normOverrides, matchLimit, evaluate,
+      buildLimitIndex, normOverrides, matchLimit, evaluate, consensus,
       flattenRow, rankedKeys, detectKey, valuesEqual, pickKeyByValues, FIELD_DEFS,
     };
   })();
@@ -1498,13 +1515,22 @@
       .filter(x => /curr/i.test(x) && /^[a-z]{3}$/i.test(Core.normSpace(row[x])))
       .map(x => Core.normSpace(row[x]));
 
-    const m = Core.matchLimit(limitIndex.entries, overrides, {
+    let m = Core.matchLimit(limitIndex.entries, overrides, {
       method: rec.method, subagent: rec.subagent, country: rec.country, currency: rec.currency, currencies,
       ref: rec.ref, refId: rec.refId, webDefaultRefs: CONFIG.webDefaultRefs, subagentId: rec.subagentId,
     });
     rec.brandMatched = !!m.brandMatched;
     rec.subMatched = !!m.subMatched;
     rec.note = m.note || '';
+    if (m.status === 'ambiguous') {
+      const c = Core.consensus(rec.amount, m.entries, rec.currency);
+      if (c) {
+        const rows = m.entries.map(e => `«${e.name}» [${e.heading}] ${fmtNum(e.min)}–${fmtNum(e.max)}`)
+          .filter((x, i, arr) => arr.indexOf(x) === i).join('; ');
+        const what = c.verdict === 'ok' ? 'сумма в лимите по каждой' : 'нарушение по каждой, показана самая мягкая граница';
+        m = Object.assign({}, m, { status: 'ok', limit: c.limit, info: [m.info, `подошло несколько строк: ${rows} — ${what}`].filter(Boolean).join('; ') });
+      }
+    }
     rec.info = m.info || ''; // справка, на ручную проверку не отправляет
     if (m.status === 'ambiguous' && m.subsChecked) {
       m.reasonExtra = `Субагента «${rec.subagent}» нет в колонке «Субы» ни одной из строк`;
