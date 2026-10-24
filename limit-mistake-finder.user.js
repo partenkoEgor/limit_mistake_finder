@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         TH Management — Limit Mistake Finder
 // @namespace    th-management-limit-mistake-finder
-// @version      1.17
+// @version      1.18
 // @description  Проходит все страницы текущего фильтра, берёт тикеты в статусах Credited (M), Credited (Fraud) (M) и Closed (M) с транзакцией в статусе OK и сверяет Amount by receipt с лимитами метода (с учётом страны) со страницы Confluence «ЛИМИТЫ РУЧНЫЕ». Тикеты ниже/выше лимита выводятся списком и выгружаются в Excel.
 // @match        *://th-managment.com/*/admin/backoffice/paymentsupport*
 // @match        *://my-managment.com/*/admin/backoffice/paymentsupport*
@@ -28,7 +28,7 @@
   if (W.__lmf_loaded) return;
   W.__lmf_loaded = true;
 
-  const VERSION = '1.17';
+  const VERSION = '1.18';
 
   // ------------------------------------------------------------------
   // НАСТРОЙКИ
@@ -97,6 +97,11 @@
     // совпадение после нормализации, RegExp — по шаблону. «1xbet22.com» →
     // «1xbet22com» подходит под /^1xbet/
     webDefaultRefs: ['webdefault', /1xbet/],
+
+    // Таблицы Confluence, которые не используются (по заголовку): скрипт
+    // проверяет только BT-методы, поэтому таблицы API («Турция Melbet API»)
+    // пропускаются. Строка — вхождение без регистра, RegExp — по шаблону
+    skipTables: [/\bapi\b/i],
 
     // Пауза между страницами списка (мс)
     pageDelay: 400,
@@ -1329,8 +1334,13 @@
         ? 'Confluence вернул страницу входа — откройте doc.office.lan в браузере и залогиньтесь'
         : 'на странице Confluence не найдено таблиц');
     }
-    const entries = Core.buildLimitIndex(tables, CONFIG.knownBrands);
-    limitIndex = { entries, tables, loadedAt: new Date() };
+    const skipTable = t => (CONFIG.skipTables || []).some(p => (p instanceof RegExp
+      ? p.test(t.heading || '')
+      : String(t.heading || '').toLowerCase().indexOf(String(p).toLowerCase()) !== -1));
+    const skipped = tables.filter(skipTable);
+    const used = tables.filter(t => !skipTable(t));
+    const entries = Core.buildLimitIndex(used, CONFIG.knownBrands);
+    limitIndex = { entries, tables: used, skipped, loadedAt: new Date() };
     const parsed = entries.filter(e => e.min != null || e.max != null).length;
     log('Лимиты загружены:', entries.length, 'строк, распознано', parsed, entries);
     return limitIndex;
@@ -1814,6 +1824,7 @@
       li = await loadLimits(false);
       const parsed = li.entries.filter(e => e.min != null || e.max != null);
       out.push(`Confluence: таблиц ${li.tables.length}, строк ${li.entries.length}, лимит распознан в ${parsed.length}`);
+      if (li.skipped && li.skipped.length) out.push(`Пропущены таблицы (CONFIG.skipTables): ${li.skipped.map(t => `«${t.heading}»`).join(', ')}`);
       li.tables.slice(0, 5).forEach((t, i) => out.push(`  Таблица ${i + 1} «${t.heading}»: колонки ${JSON.stringify(t.headers)}`));
       out.push('Примеры распознанных строк:');
       parsed.slice(0, 8).forEach(e => out.push(`  ${e.name} [${e.country}] → min ${fmtNum(e.min)}, max ${fmtNum(e.max)}${e.striked ? ' (зачёркнута)' : ''}`));

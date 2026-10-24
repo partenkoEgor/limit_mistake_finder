@@ -26,6 +26,7 @@ Tampermonkey-скрипт **TH Management — Limit Mistake Finder** (`limit-mis
 ## Как ищется лимит
 1. Берётся `method` тикета (например, ` Sham Cash SYP`), затем он же без кода валюты (`Sham Cash`), затем `Subagent` как запасной вариант. **Если Subagent прямо называет метод из Confluence** («Arcturus **CLIQ** Jordan» → «Cliq»), а method указывает на другую строку («Bank al Etihad») — важнее Subagent; это отмечается в колонке «Примечание».
 2. Совпадение с колонкой «Метод» в Confluence: точное (в том числе без бренда в скобках: «ATTIJARI (1XCasino)» → «ATTIJARI») → без пробелов и апострофов («L'bankalik» = «Lbankalik») → вхождение целыми словами. При вхождении выигрывает самое длинное название: `Cash Plus` важнее, чем `Cash`.
+   Таблицы API («Турция Melbet API») не используются: скрипт проверяет только BT-методы (`CONFIG.skipTables`).
 3. **Страна:** `nameCountry` тикета (Syria, Kyrgyzstan…) сверяется с колонкой «Страна» и заголовком таблицы (Сирия, Киргизия…). Словарь стран — `COUNTRY_ALIASES` в скрипте. Таблицы, страну которых скрипт не узнал, перечислены в «Диагностике».
 4. **Проект (бренд):** по `nameRef`/`refId` тикета выбирается строка своего проекта. Проект строки определяется по **заголовку таблицы** («Египет 1XCasino», «Турция Melbet BT», «Марокко BizBet Africa (Ar) 365», «…расшарены с рефки 1 на 292»), по бренду в скобках и по «Переключалке»; таблица с одним названием страны — webDefault:
    - для `webDefault` (и зеркал 1xbet: `1xbet22.com`, `bo.1xbet.com`…) — строки не из таблиц проектов, приоритет у строк с `webdefault` / `default` в «Переключалке»;
@@ -65,5 +66,6 @@ Tampermonkey-скрипт **TH Management — Limit Mistake Finder** (`limit-mis
 - `fields` — явно задать ключ JSON. По умолчанию `amount: 'amount'` (Amount by receipt); для суммы транзакции было бы `'summa'`.
 - `knownBrands` — список брендов/проектов для выбора строки по `nameRef`.
 - `limitOverrides` — ручные лимиты, они важнее Confluence; ключ — method или subagent: `'Sham Cash SYP': { min: 100, max: 30000 }`.
+- `skipTables` — таблицы Confluence, которые не используются (по заголовку). Скрипт проверяет только BT-методы, поэтому по умолчанию `[/\bapi\b/i]` — пропускаются таблицы API, например «Турция Melbet API». Пропущенные таблицы перечислены в «Диагностике».
 - `limitsPageUrl` — адрес страницы лимитов.
 - `pageDelay`, `pageRetries`, `pollInterval`, `pollMax` — темп обхода страниц и повторы при ошибках.
